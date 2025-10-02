@@ -2,13 +2,13 @@
 
 from distutils.core import setup
 
-setup(name='sarix',
+setup(name='sarix-fourier',
     version='0.0.1',
     description='Seasonal AR, Integrated models with eXogenous predictors',
     author='Evan L. Ray',
     author_email='elray@umass.edu',
     url='https://github.com/elray1/sarix',
-    packages=['sarix'],
+    packages=['sarix-fourier'],
     install_requires=[
         'numpy',
         'matplotlib',
