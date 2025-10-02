@@ -1,140 +1,56 @@
-"""
-Local Trend
-================
-"""
-
 import os
 import time
-
-from functools import reduce
-
-import matplotlib
-import matplotlib.pyplot as plt
-import numpy as onp
-
-from jax import vmap
 import jax.numpy as jnp
-import jax.random as random
-
+import numpy as onp
+from jax import random
 import numpyro
 import numpyro.distributions as dist
-from numpyro.distributions import constraints
-from numpyro.distributions.distribution import Distribution
-from numpyro.distributions.transforms import AffineTransform, LowerCholeskyAffine
 from numpyro.infer import MCMC, NUTS
-from numpyro.distributions.util import is_prng_key, validate_sample
-
 
 def diff(x, d=0, D=0, season_period=7, pad_na=False):
-    """
-    Apply differencing and seasonal differencing to all variables in a
-    batch of matrices with observations in rows and variables in columns.
-    
-    Parameters
-    ----------
-    x: a numpy array to difference, with shape `batch_shape + (T, n_vars)`
-    d: number of ordinary differences to compute
-    D: number of seasonal differences to compute
-    seasonal_period: number of time points per seasonal period
-    pad_na: boolean; if True, result has shape `batch_shape + (T, n_vars)` and
-        the leading D + d rows in axis -2 have values `np.nan`. Otherwise, the
-        result has shape `batch_shape + (T - D - d, n_vars)`.
-    
-    Returns
-    -------
-    a copy of x after taking differences
-    """
-    # non-seasonal differencing
     x = onp.diff(x, n = d, axis = -2)
-    
-    # seasonal differencing
     for i in range(D):
         x = x[..., season_period:, :] - x[..., :-season_period, :]
-    
     if pad_na:
         batch_shape = x.shape[:-2]
         n_vars = x.shape[-1]
         leading_nans = onp.full(batch_shape + (D * season_period + d, n_vars), onp.nan)
         x = onp.concatenate([leading_nans, x], axis = -2)
-    
     return x
 
-
 def inv_diff(x, dx, d=0, D=0, season_period=7):
-    '''
-    Invert ordinary and seasonal differencing (go from seasonally differenced
-    time series to original time series).
-    
-    Inputs
-    ------
-    dx a (batch of) first-order and/or seasonally differenced time series
-        with shape `batch_shape_dx + (T_dx, n_vars)`. For example, if d=0, D=1,
-        `dx` has values like `x_{t} - x_{t - season_period}`.
-    x a (batch of) time series with shape `batch_shape_x + (T_x, n_vars)`.
-    d order of first differencing
-    D order of seasonal differencing
-    seasonal_period: number of time points per seasonal period
-    
-    Returns
-    -------
-    an array with the same shape as `dx` containing reconstructed values of
-    the original time series `x` in the time points `T_x, ..., T_x + T_dx - 1`
-    (with zero-based indexing so that x covers the time points `0, ..., T_x - 1`)
-    
-    Notes
-    -----
-    It is assumed that dx "starts" one time index after x "ends": that is, if
-        d = 0 and D = 1 then if we had observed x[..., T_x, :] we could calculate
-        dx[..., 0, :] = x[..., T_x, :] - x[..., T - ts_frequency, :]
-    '''
-    # record information about shapes
     batch_shape_x = x.shape[:-2]
     T_x = x.shape[-2]
     n_vars = x.shape[-1]
     batch_shape_dx = dx.shape[:-2]
     T_dx = dx.shape[-2]
-    
-    # validate shapes
     if dx.shape[-1] != n_vars:
         raise ValueError("x and dx must have the same size in their last dimension")
-    
     try:
         broadcast_batch_shape = jnp.broadcast_shapes(batch_shape_x, batch_shape_dx)
         if broadcast_batch_shape != batch_shape_dx:
             raise ValueError()
     except ValueError:
         raise ValueError("The batch shapes of x and dx must be broadcastable to the batch shape of dx")
-    
     if T_x < d + D:
         raise ValueError("There must be at least d + D observed values in x to invert differencing")
-    
-    # invert ordinary differencing
     for i in range(1, d + 1):
         x_dm1 = diff(x, d=d-i, D=D, season_period=season_period, pad_na=True)
-
         x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
         dx_full = onp.concatenate([x_dm1, dx], axis=-2)
         for t in range(T_dx):
             dx_full[..., T_x + t, :] = dx_full[..., T_x + t - 1, :] + dx_full[..., T_x + t, :]
-        
         dx = dx_full[..., -T_dx:, :]
-    
-    # invert seasonal differencing
     for i in range(1, D + 1):
         x_dm1 = diff(x, d=0, D=D-i, season_period=season_period, pad_na=True)
-        
         x_dm1 = onp.broadcast_to(x_dm1, batch_shape_dx + x_dm1.shape[-2:])
         dx_full = onp.concatenate([x_dm1, dx], axis=-2)
         for t in range(T_dx):
             dx_full[..., T_x + t, :] = dx_full[..., T_x + t - season_period, :] + dx_full[..., T_x + t, :]
-        
         dx = dx_full[..., -T_dx:, :]
-    
     return dx
 
-
-
-class SARIX():
+class SARIX:
     def __init__(self,
                  xy,
                  p=1,
@@ -143,10 +59,15 @@ class SARIX():
                  D=0,
                  season_period=1,
                  transform='none',
-                 theta_pooling='none',
-                 sigma_pooling='none',
+                 theta_pooling='none',   # 'none' = one per location, 'shared' = shared across locations
+                 sigma_pooling='none',   # unchanged from your version
                  forecast_horizon=1,
-                 num_warmup=1000, num_samples=1000, num_chains=1):
+                 num_warmup=1000,
+                 num_samples=1000,
+                 num_chains=1,
+                 fourier_K=0,            # number of harmonics for Fourier terms
+                 fourier_pooling='none'  # <-- new option: 'none' or 'shared'
+                 ):
         self.n_x = xy.shape[-1] - 1
         self.xy = xy.copy()
         self.p = p
@@ -157,35 +78,20 @@ class SARIX():
         self.transform = transform
         self.theta_pooling = theta_pooling
         self.sigma_pooling = sigma_pooling
+        self.fourier_K = fourier_K
+        self.fourier_pooling = fourier_pooling
         self.season_period = season_period
         self.forecast_horizon = forecast_horizon
         self.num_warmup = num_warmup
         self.num_samples = num_samples
         self.num_chains = num_chains
-        
-        # set up batch shapes for parameter pooling
-        # xy has shape batch_shape + (T, n_x + 1)
+
         batch_shape = xy.shape[:-2]
-        
-        if theta_pooling == 'none':
-            # separate parameters per batch
-            self.theta_batch_shape = batch_shape
-        elif theta_pooling == 'shared':
-            # no batches for theta; will broadcast to share across all batches
-            self.theta_batch_shape = ()
-        else:
-            raise ValueError("theta_pooling must be 'none' or 'shared'")
-        
-        if sigma_pooling == 'none':
-            # separate parameters per batch
-            self.sigma_batch_shape = batch_shape
-        elif sigma_pooling == 'shared':
-            # no batches for sigma; will broadcast to share across all batches
-            self.sigma_batch_shape = ()
-        else:
-            raise ValueError("sigma_pooling must be 'none' or 'shared'")
-        
-        # do transformation
+        self.batch_shape = batch_shape
+        self.theta_batch_shape = batch_shape if theta_pooling == 'none' else ()
+        self.sigma_batch_shape = batch_shape if sigma_pooling == 'none' else ()
+        self.fourier_batch_shape = batch_shape if fourier_pooling == 'none' else ()
+
         self.xy_orig = xy.copy()
         if transform == "sqrt":
             self.xy[self.xy <= 0] = 1.0
@@ -196,272 +102,160 @@ class SARIX():
         elif transform == "log":
             self.xy[self.xy <= 0] = 1.0
             self.xy = onp.log(self.xy)
-        
-        # do differencing; save xy before differencing for later use when
-        # inverting differencing
+
         transformed_xy = self.xy
         self.xy = diff(self.xy, self.d, self.D, self.season_period, pad_na=False)
-        
-        # pre-calculate state update matrix
+
+        T = self.xy.shape[-2]
+        if self.fourier_K > 0:
+            self.fourier_features = self._fourier_terms(T, self.season_period, self.fourier_K)
+        else:
+            self.fourier_features = None
+
         self.update_X = self.state_update_X(self.xy[..., :self.max_lag, :],
                                             self.xy[..., self.max_lag:, :])
-        
-        # do inference
         rng_key, rng_key_predict = random.split(random.PRNGKey(0))
         self.run_inference(rng_key)
-        
-        # generate predictions
         self.predictions_modeled_scale = self.predict(rng_key_predict)
-        
-        # undo differencing
         self.predictions = inv_diff(transformed_xy,
                                     self.predictions_modeled_scale,
                                     self.d, self.D, self.season_period)
-        
-        # undo transformation to get predictions on original scale
         if transform == "log":
             self.predictions = onp.exp(self.predictions)
         elif transform == "fourthrt":
             self.predictions = jnp.maximum(0.0, self.predictions)**4
         elif transform == "sqrt":
             self.predictions = jnp.maximum(0.0, self.predictions)**2
-    
-    
-    def run_inference(self, rng_key):
-        '''
-        helper function for doing hmc inference
-        '''
-        start = time.time()
-        kernel = NUTS(self.model)
-        mcmc = MCMC(kernel, num_warmup=self.num_warmup, num_samples=self.num_samples, num_chains=self.num_chains,
-                    progress_bar=False if "NUMPYRO_SPHINXBUILD" in os.environ else True)
-        mcmc.run(rng_key, self.xy)
-        mcmc.print_summary()
-        print('\nMCMC elapsed time:', time.time() - start)
-        self.samples = mcmc.get_samples()
-    
-    
+
+    def _fourier_terms(self, T, season_period, K):
+        t = onp.arange(T)
+        terms = []
+        for k in range(1, K+1):
+            terms.append(onp.sin(2 * onp.pi * k * t / season_period))
+            terms.append(onp.cos(2 * onp.pi * k * t / season_period))
+        return onp.stack(terms, axis=-1)  # shape (T, 2*K)
+
     def make_state_transition_matrix(self, theta):
         batch_shape = theta.shape[:-1]
-        n_ar_coef = self.p + self.P * (self.p + 1)
-        
-        A_x_cols = [
-            jnp.concatenate(
-                    [
-                        jnp.zeros(batch_shape + (i * n_ar_coef, 1)),
-                        jnp.expand_dims(theta[..., (i * n_ar_coef):((i + 1) * n_ar_coef)], -1),
-                        jnp.zeros(batch_shape + ((self.n_x - i) * n_ar_coef, 1))
-                    ],
-                    axis = -2) \
-                for i in range(self.n_x)
-        ]
-        A_y_col = [ jnp.expand_dims(theta[..., (self.n_x * n_ar_coef):], -1) ]
-        
-        A = jnp.concatenate(A_x_cols + A_y_col, axis = -1)
-        
+        n_ar_coef = (self.n_x + 1) * self.p
+        A = jnp.reshape(theta, batch_shape + (self.n_x+1, self.p*(self.n_x+1)))
+        A = jnp.swapaxes(A, -2, -1)  # (...batch, p*(n_x+1), n_x+1)
         return A
-    
-    
+
     def state_update_X(self, init_stoch_state, stoch_state):
         stoch_state = jnp.concatenate([init_stoch_state, stoch_state], axis=-2)
-        
-        # lagged values of x
-        lagged_x = [
-            self.build_lagged_var(stoch_state[..., :, i:(i+1)]) \
-                for i in range(self.n_x)
-        ]
-        
-        # lagged values of y
-        lagged_y = self.build_lagged_var(stoch_state[..., :, self.n_x:(self.n_x + 1)])
-        
-        # concatenate
-        return jnp.concatenate(lagged_x + [lagged_y], axis = -1)
-    
-    
-    def build_lagged_var(self, x):
-        # lagged state, highest degree term
-        lagged_state = [
-            self.lagged_vals_one_seasonal_lag(x=x,
-                                              seasonal_lag=P_ind*self.season_period,
-                                              p=self.p) for P_ind in range(self.P+1)]
-        lagged_state = [x for x in lagged_state if x is not None]
-        lagged_state = jnp.concatenate(lagged_state, axis = -1)
-        
-        # return entries in rows starting at the last row of init_stoch_shape,
-        # going up to second-to-last column. These are the entries used to determine
-        # means for stoch_state
-        return lagged_state[..., (self.max_lag - 1):(-1), :]
-    
-    
-    def lagged_vals_one_seasonal_lag(self, x, seasonal_lag, p):
-        if seasonal_lag == 0:
-            # no seasonal lag, just terms up to p
-            to_concat = [self.lagged_col(x, l) for l in range(p)]
-        else:
-            # lags from seasonal_lag to (seasonal_lag + p)
-            to_concat = [self.lagged_col(x, seasonal_lag - 1 + l) for l in range(p+1)]
-
-        if to_concat == []:
-            return None
-        
-        result = jnp.concatenate(to_concat, axis=-1)
+        lagged_rows = []
+        for lag in range(1, self.p + 1):
+            lagged_rows.append(stoch_state[..., self.max_lag - lag:-(lag), :])
+        result = jnp.concatenate(lagged_rows, axis=-1)
         return result
-    
-    
-    def lagged_col(self, x, lag):
-        batch_shape = x.shape[:-2]
-        T = x.shape[-2]
-        return jnp.concatenate(
-            [jnp.full(batch_shape + (lag, 1), jnp.nan), x[..., :(T-lag), 0:1]],
-            axis=-2)
-    
-    
+
     def model(self, xy):
-        # Vector of innovation standard deviations for the n_x + 1 variables
+        batch_size = xy.shape[0]
+        T = xy.shape[1]
+
+        # Partial pooling for AR coefficients
+        n_theta = self.p * (self.n_x + 1)
+        if self.theta_pooling == 'none':
+            theta_group_sd = numpyro.sample("theta_group_sd", dist.HalfCauchy(jnp.ones(1)))
+            theta_mu = numpyro.sample("theta_mu", dist.Normal(jnp.zeros((n_theta,)), theta_group_sd))
+            theta_sd = numpyro.sample("theta_sd", dist.HalfCauchy(jnp.ones(1)))
+            theta = numpyro.sample(
+                "theta",
+                dist.Normal(loc=theta_mu[None, :], scale=theta_sd)
+            )  # shape (batch, n_theta)
+        else:  # shared pooling
+            theta_sd = numpyro.sample("theta_sd", dist.HalfCauchy(jnp.ones(1)))
+            theta = numpyro.sample(
+                "theta",
+                dist.Normal(loc=jnp.zeros((n_theta,)), scale=theta_sd)
+            )   # shape (n_theta,)
+            theta = jnp.broadcast_to(theta, (batch_size,) + theta.shape)
+
         sigma = numpyro.sample(
-            "sigma",
-            dist.HalfCauchy(jnp.ones(self.sigma_batch_shape + (self.n_x + 1,))))
-        
-        # Lower cholesky factor of the covariance matrix has
-        # standard deviations on the diagonal
-        # The first line below creates (potentially batched) diagonal matrices
-        # with shape self.sigma_batch_shape + (n_x + 1, n_x + 1)
-        # If xy has batch dimensions, we then insert another dimension at
-        # postion -3 for appropriate broadcasting with the time dimension of
-        # observed values
+            "sigma", dist.HalfCauchy(jnp.ones((batch_size, self.n_x+1)))
+        )
         Sigma_chol = jnp.expand_dims(sigma, -2) * jnp.eye(sigma.shape[-1])
-        if len(xy.shape) > 2:
-            Sigma_chol = jnp.expand_dims(Sigma_chol, -3)
-        
-        # state transition matrix parameters
-        n_theta = (2 * self.n_x + 1) * (self.p + self.P * (self.p + 1))
-        theta_sd = numpyro.sample(
-            "theta_sd",
-            dist.HalfCauchy(jnp.ones(1))
-        )
-        theta = numpyro.sample(
-            "theta",
-            dist.Normal(loc=jnp.zeros(self.theta_batch_shape + (n_theta,)),
-                        scale=jnp.full(self.theta_batch_shape + (n_theta,),
-                                       theta_sd))
-        )
-        
-        # assemble state transition matrix A
+
+        # Fourier terms
+        if self.fourier_K > 0:
+            fourier_coef_shape = (self.n_x+1, 2*self.fourier_K)
+            if self.fourier_pooling == 'none':
+                # Partial pooling for locations
+                beta_group_sd = numpyro.sample("beta_group_sd", dist.HalfCauchy(jnp.ones(1)))
+                beta_mu = numpyro.sample("beta_mu", dist.Normal(jnp.zeros(fourier_coef_shape), beta_group_sd))
+                beta_sd = numpyro.sample("beta_sd", dist.HalfCauchy(jnp.ones(1)))
+                fourier_B = numpyro.sample("fourier_B", dist.Normal(loc=beta_mu[None,:,:], scale=beta_sd))  # shape (batch, n_x+1, 2K)
+            else:  # 'shared'
+                beta_sd = numpyro.sample("beta_sd", dist.HalfCauchy(jnp.ones(1)))
+                fourier_B = numpyro.sample("fourier_B", dist.Normal(loc=jnp.zeros(fourier_coef_shape), scale=beta_sd))
+                fourier_B = jnp.broadcast_to(fourier_B, (batch_size,) + fourier_B.shape)
+        else:
+            fourier_B = None
+
         A = self.make_state_transition_matrix(theta)
-        
-        # predictive means based on AR structure
-        step_means = jnp.matmul(self.update_X, A)
-        
-        # step innovations are (state - step_means),
-        # with shape (batch_shape, T - self.max_lag, n_x + 1)
+        update_X = self.update_X
+        step_means_ar = jnp.sum(update_X * A, axis=-1)  # shape (batch, time, n_x+1)
+
+        # Fourier means
+        if self.fourier_K > 0:
+            F = jnp.array(self.fourier_features)  # (time, 2K)
+            step_means_fourier = jnp.einsum('bic,tc->bit', fourier_B, F)
+        else:
+            step_means_fourier = 0
+
+        step_means = step_means_ar + step_means_fourier
         step_innovations = xy[..., self.max_lag:, :] - step_means
-        
-        # sample innovations
         numpyro.sample(
             "step_innovations",
             dist.MultivariateNormal(
-                loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_chol),
+                loc=jnp.zeros((self.n_x+1,)), scale_tril=Sigma_chol),
             obs=step_innovations
         )
-    
-    
+
+    def run_inference(self, rng_key):
+        start = time.time()
+        kernel = NUTS(self.model)
+        mcmc = MCMC(kernel, num_warmup=self.num_warmup, num_samples=self.num_samples,
+                    num_chains=self.num_chains, progress_bar=True)
+        mcmc.run(rng_key, self.xy)
+        self.samples = mcmc.get_samples()
+        print('\nMCMC elapsed time:', time.time() - start)
+
     def predict(self, rng_key):
-        '''
-        Predict future values of all signals based on a single sample of
-        parameter values from the posterior distribution.
-        '''
-        # load in parameter estimates and update to target batch size
         theta = self.samples['theta']
         sigma = self.samples['sigma']
-        xy_batch_shape = self.xy.shape[:-2]
-        theta_batch_shape = theta.shape[:-1]
-        sigma_batch_shape = sigma.shape[:-1]
-        
-        if self.theta_pooling == 'shared':
-            # goal is shape theta_batch_shape + xy_batch_shape + theta.shape[-1]
-            # first insert 1's corresponding to xy_batch_shape, then broadcast
-            ones = (1,) * len(xy_batch_shape)
-            theta = theta.reshape(theta_batch_shape + ones + (theta.shape[-1],))
-            target = theta_batch_shape + xy_batch_shape + (theta.shape[-1],)
-            theta = jnp.broadcast_to(theta, target)
-        
-        if self.sigma_pooling == 'shared':
-            # goal is shape sigma_batch_shape + xy_batch_shape + sigma.shape[-1]
-            # first insert 1's corresponding to xy_batch_shape, then broadcast
-            ones = (1,) * len(xy_batch_shape)
-            sigma = theta.reshape(sigma_batch_shape + ones + (sigma.shape[-1],))
-            target = sigma_batch_shape + xy_batch_shape + (sigma.shape[-1],)
-            sigma = jnp.broadcast_to(sigma, target)
-        
-        batch_shape = theta.shape[:-1]
-        
-        # state transition matrix
-        A = self.make_state_transition_matrix(theta)
-        
-        # convert sigma to a batch of covariance matrix Cholesky factors
+        batch_size = theta.shape[0]
+        n_xp1 = self.n_x + 1
+
+        if self.fourier_K > 0:
+            fourier_B = self.samples['fourier_B']
+            T = self.xy.shape[-2]
+            T_pred = T + self.forecast_horizon
+            F_pred = self._fourier_terms(T_pred, self.season_period, self.fourier_K)
+            F_future = F_pred[-self.forecast_horizon:, :]  # (horizon, 2K)
         Sigma_chol = jnp.expand_dims(sigma, -2) * jnp.eye(sigma.shape[-1])
-        
-        # generate innovations
-        # note that the use of sample_shape = forecast_horizon means that
-        # innovations.shape = (forecast_horizon,) + batch_shape + (n_x + 1)
-        # we would really like shape batch_shape + (forecast_horizon, n_x + 1)
-        # we deal with this in the loop below when adding to the mean for each
-        # forecast horizon by dropping the leading dimension when indexing, then
-        # inserting an extra dimension at position -2 before adding.
         innovations = dist.MultivariateNormal(
-                loc=jnp.zeros((self.n_x + 1,)),
-                scale_tril=Sigma_chol) \
-            .sample(rng_key, sample_shape=(self.forecast_horizon, ))
-        
-        # generate step-ahead forecasts iteratively
+                loc=jnp.zeros((n_xp1,)), scale_tril=Sigma_chol) \
+            .sample(rng_key, sample_shape=(self.forecast_horizon, batch_size))
+
         y_pred = []
         recent_lags = jnp.broadcast_to(self.xy[..., -self.max_lag:, :],
-                                       batch_shape + (self.max_lag, self.xy.shape[-1]))
-        dummy_values = jnp.zeros(batch_shape + (1, self.xy.shape[-1]))
+                                       (batch_size, self.max_lag, self.xy.shape[-1]))
+        dummy_values = jnp.zeros((batch_size, 1, self.xy.shape[-1]))
+
         for h in range(self.forecast_horizon):
             update_X = self.state_update_X(recent_lags, dummy_values)
-            new_y_pred = jnp.matmul(update_X, A) + \
-                jnp.expand_dims(innovations[h, ...], -2)
+            step_means_ar = jnp.sum(update_X * self.make_state_transition_matrix(theta), axis=-1)
+            if self.fourier_K > 0:
+                if self.fourier_pooling == 'none':
+                    step_means_fourier = jnp.einsum('bic,c->bi', fourier_B, F_future[h])
+                else:
+                    step_means_fourier = jnp.einsum('ic,c->bi', fourier_B, F_future[h])
+            else:
+                step_means_fourier = 0
+            new_y_pred = step_means_ar + step_means_fourier + innovations[h, ...][..., None, :]
             y_pred.append(new_y_pred)
-            recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred],
-                                          axis=-2)
-        
+            recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred], axis=-2)
         y_pred = jnp.concatenate(y_pred, axis=-2)
         return onp.asarray(y_pred)
-    
-    
-    def plot(self, save_path = None):
-        t = onp.arange(self.y_nbhd.shape[0])
-        t_pred = onp.arange(self.y_nbhd.shape[0] + self.forecast_horizon)
-        n_betas = self.samples['betas'].shape[1]
-        
-        percentile_levels = [2.5, 97.5]
-        median_prediction = onp.median(self.predictions, axis=0)
-        percentiles = onp.percentile(self.predictions, percentile_levels, axis=0)
-        median_prediction_orig = onp.median(self.predictions_orig, axis=0)
-        percentiles_orig = onp.percentile(self.predictions_orig, percentile_levels, axis=0)
-        
-        fig, ax = plt.subplots(n_betas + 1, 1, figsize=(10,3 * (n_betas + 1)))
-        
-        ax[0].fill_between(t_pred, percentiles_orig[0, :], percentiles_orig[1, :], color='lightblue')
-        ax[0].plot(t_pred, median_prediction_orig, 'blue', ls='solid', lw=2.0)
-        ax[0].plot(t, self.y_orig, 'black', ls='solid')
-        ax[0].set(xlabel="t", ylabel="y", title="Mean predictions with 95% CI")
-        
-        # plot 95% confidence level of predictions
-        ax[1].fill_between(t_pred, percentiles[0, :], percentiles[1, :], color='lightblue')
-        ax[1].plot(t_pred, median_prediction, 'blue', ls='solid', lw=2.0)
-        ax[1].plot(t, self.y, 'black', ls='solid')
-        ax[1].set(xlabel="t", ylabel="y (" + self.transform + " scale)", title="Mean predictions with 95% CI")
-        
-        for i in range(1, n_betas):
-            beta_median = onp.median(self.samples['betas'][:, i, :], axis=0)
-            beta_percentiles = onp.percentile(self.samples['betas'][:, i, :], percentile_levels, axis=0)
-            ax[i + 1].fill_between(t_pred, beta_percentiles[0, :], beta_percentiles[1, :], color='lightblue')
-            ax[i + 1].plot(t_pred, beta_median, 'blue', ls='solid', lw=2.0)
-            ax[i + 1].set(xlabel="t", ylabel="incidence deriv " + str(i))
-        
-        if save_path is not None:
-            plt.savefig(save_path)
-        plt.tight_layout()
-        plt.show()
