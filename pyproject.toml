@@ -1,0 +1,25 @@
+[project]
+name = "sarixfourier"
+version = "0.1.0"
+description = "Extension of sarix to add Fourier terms"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "iddata @ git+https://github.com/reichlab/iddata.git",
+    "idmodels @ git+https://github.com/reichlab/idmodels.git",
+    "jax>=0.7.2",
+    "numpy>=2.3.3",
+    "numpyro>=0.19.0",
+    "pandas>=2.3.3",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3.5"
+]
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+sarixfourier = { path = "src/sarixfourier" }
