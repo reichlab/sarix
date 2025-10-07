@@ -249,7 +249,10 @@ class SARIX():
                  forecast_horizon=1,
                  num_warmup=1000, num_samples=1000, num_chains=1,
                  day_of_year=None,
-                 fourier_K=0):
+                 fourier_K=0,
+                 sigma_prior_scale=1.0,
+                 theta_sd_prior_scale=1.0,
+                 fourier_beta_sd_prior_scale=1.0):
         self.n_x = xy.shape[-1] - 1
         self.xy = xy.copy()
         self.p = p
@@ -267,6 +270,9 @@ class SARIX():
         self.num_chains = num_chains
         self.fourier_K = fourier_K
         self.day_of_year = day_of_year
+        self.sigma_prior_scale = sigma_prior_scale
+        self.theta_sd_prior_scale = theta_sd_prior_scale
+        self.fourier_beta_sd_prior_scale = fourier_beta_sd_prior_scale
 
         # Validate Fourier parameters
         if fourier_K > 0 and day_of_year is None:
@@ -490,7 +496,7 @@ class SARIX():
         # Vector of innovation standard deviations for the n_x + 1 variables
         sigma = numpyro.sample(
             "sigma",
-            dist.HalfCauchy(jnp.ones(self.sigma_batch_shape + (self.n_x + 1,))))
+            dist.HalfCauchy(self.sigma_prior_scale * jnp.ones(self.sigma_batch_shape + (self.n_x + 1,))))
 
         # Lower cholesky factor of the covariance matrix has
         # standard deviations on the diagonal
@@ -507,7 +513,7 @@ class SARIX():
         n_theta = (2 * self.n_x + 1) * (self.p + self.P * (self.p + 1))
         theta_sd = numpyro.sample(
             "theta_sd",
-            dist.HalfCauchy(jnp.ones(1))
+            dist.HalfCauchy(self.theta_sd_prior_scale * jnp.ones(1))
         )
         theta = numpyro.sample(
             "theta",
@@ -528,7 +534,7 @@ class SARIX():
             # Shape: (fourier_batch_shape, n_x+1, 2*K)
             fourier_beta_sd = numpyro.sample(
                 "fourier_beta_sd",
-                dist.HalfCauchy(jnp.ones(1))
+                dist.HalfCauchy(self.fourier_beta_sd_prior_scale * jnp.ones(1))
             )
             fourier_beta = numpyro.sample(
                 "fourier_beta",

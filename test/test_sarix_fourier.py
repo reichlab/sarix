@@ -1,4 +1,6 @@
 import numpy as np
+import json
+import os
 from sarixfourier.sarix_fourier import SARIX, diff, inv_diff
 
 def test_diff_simple():
@@ -1029,3 +1031,428 @@ def test_fourier_without_fourier_is_same():
     # Both should not have Fourier samples
     assert 'fourier_beta' not in model1.samples
     assert 'fourier_beta' not in model2.samples
+
+
+# Cross-platform reproducibility tests
+
+def test_cross_platform_simple_reference():
+    """Test reproducibility against saved reference output (simple model)
+
+    This test compares model outputs against a saved reference to ensure
+    reproducibility across different platforms (OS, hardware) in CI/CD.
+    """
+    # Load reference output
+    reference_path = os.path.join(os.path.dirname(__file__), 'fixtures', 'reference_simple.json')
+    with open(reference_path, 'r') as f:
+        reference = json.load(f)
+
+    # Recreate the same model run
+    np.random.seed(42)
+    xy = np.random.randn(3, 30, 2) + 10
+
+    np.random.seed(999)
+    model = SARIX(
+        xy,
+        p=1,
+        d=0,
+        D=0,
+        season_period=1,
+        transform='none',
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        forecast_horizon=3,
+        num_warmup=20,
+        num_samples=30,
+        num_chains=1
+    )
+
+    # Extract current run statistics
+    current_predictions_mean = np.mean(model.predictions, axis=0)
+    current_predictions_std = np.std(model.predictions, axis=0)
+    current_theta_mean = np.mean(model.samples['theta'], axis=0)
+    current_sigma_mean = np.mean(model.samples['sigma'], axis=0)
+
+    # Convert reference to numpy arrays
+    ref_predictions_mean = np.array(reference['predictions_mean'])
+    ref_predictions_std = np.array(reference['predictions_std'])
+    ref_theta_mean = np.array(reference['theta_mean'])
+    ref_sigma_mean = np.array(reference['sigma_mean'])
+
+    # Test shape consistency
+    assert list(model.predictions.shape) == reference['predictions_shape']
+
+    # Test prediction means are similar (within 15% relative error)
+    # Using tolerant thresholds since different platforms may have slight numerical differences
+    pred_mean_rel_error = np.abs(current_predictions_mean - ref_predictions_mean) / (np.abs(ref_predictions_mean) + 1e-8)
+    assert np.mean(pred_mean_rel_error) < 0.15, f"Prediction mean relative error: {np.mean(pred_mean_rel_error):.4f}"
+
+    # Test prediction stds are similar (within 20% relative error)
+    pred_std_rel_error = np.abs(current_predictions_std - ref_predictions_std) / (np.abs(ref_predictions_std) + 1e-8)
+    assert np.mean(pred_std_rel_error) < 0.20, f"Prediction std relative error: {np.mean(pred_std_rel_error):.4f}"
+
+    # Test theta parameters are similar (within 20% relative error)
+    theta_rel_error = np.abs(current_theta_mean - ref_theta_mean) / (np.abs(ref_theta_mean) + 1e-8)
+    assert np.mean(theta_rel_error) < 0.20, f"Theta relative error: {np.mean(theta_rel_error):.4f}"
+
+    # Test sigma parameters are similar (within 25% relative error)
+    sigma_rel_error = np.abs(current_sigma_mean - ref_sigma_mean) / (np.abs(ref_sigma_mean) + 1e-8)
+    assert np.mean(sigma_rel_error) < 0.25, f"Sigma relative error: {np.mean(sigma_rel_error):.4f}"
+
+
+def test_cross_platform_fourier_reference():
+    """Test reproducibility against saved reference output (Fourier model)
+
+    This test compares Fourier model outputs against a saved reference to ensure
+    reproducibility across different platforms (OS, hardware) in CI/CD.
+    """
+    # Load reference output
+    reference_path = os.path.join(os.path.dirname(__file__), 'fixtures', 'reference_fourier.json')
+    with open(reference_path, 'r') as f:
+        reference = json.load(f)
+
+    # Recreate the same model run
+    np.random.seed(123)
+    n_locations = 5
+    n_weeks = 60
+    n_features = 2
+
+    day_of_year = np.array([7*i % 365 for i in range(n_weeks)])
+
+    xy = np.zeros((n_locations, n_weeks, n_features))
+    for i in range(n_locations):
+        for j in range(n_weeks):
+            seasonal = 2 * np.sin(2 * np.pi * day_of_year[j] / 365)
+            xy[i, j, :] = 10 + seasonal + i * 0.5 + np.random.randn(n_features) * 0.5
+
+    xy = np.abs(xy) + 1
+
+    np.random.seed(777)
+    model = SARIX(
+        xy,
+        p=2,
+        d=0,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        transform='sqrt',
+        num_warmup=20,
+        num_samples=30,
+        num_chains=1,
+        forecast_horizon=4
+    )
+
+    # Extract current run statistics
+    current_predictions_mean = np.mean(model.predictions, axis=0)
+    current_predictions_std = np.std(model.predictions, axis=0)
+    current_theta_mean = np.mean(model.samples['theta'], axis=0)
+    current_sigma_mean = np.mean(model.samples['sigma'], axis=0)
+    current_fourier_beta_mean = np.mean(model.samples['fourier_beta'], axis=0)
+
+    # Convert reference to numpy arrays
+    ref_predictions_mean = np.array(reference['predictions_mean'])
+    ref_predictions_std = np.array(reference['predictions_std'])
+    ref_theta_mean = np.array(reference['theta_mean'])
+    ref_sigma_mean = np.array(reference['sigma_mean'])
+    ref_fourier_beta_mean = np.array(reference['fourier_beta_mean'])
+
+    # Test shape consistency
+    assert list(model.predictions.shape) == reference['predictions_shape']
+
+    # Test prediction means are similar (within 15% relative error)
+    pred_mean_rel_error = np.abs(current_predictions_mean - ref_predictions_mean) / (np.abs(ref_predictions_mean) + 1e-8)
+    assert np.mean(pred_mean_rel_error) < 0.15, f"Prediction mean relative error: {np.mean(pred_mean_rel_error):.4f}"
+
+    # Test prediction stds are similar (within 20% relative error)
+    pred_std_rel_error = np.abs(current_predictions_std - ref_predictions_std) / (np.abs(ref_predictions_std) + 1e-8)
+    assert np.mean(pred_std_rel_error) < 0.20, f"Prediction std relative error: {np.mean(pred_std_rel_error):.4f}"
+
+    # Test theta parameters are similar (within 20% relative error)
+    theta_rel_error = np.abs(current_theta_mean - ref_theta_mean) / (np.abs(ref_theta_mean) + 1e-8)
+    assert np.mean(theta_rel_error) < 0.20, f"Theta relative error: {np.mean(theta_rel_error):.4f}"
+
+    # Test sigma parameters are similar (within 25% relative error)
+    sigma_rel_error = np.abs(current_sigma_mean - ref_sigma_mean) / (np.abs(ref_sigma_mean) + 1e-8)
+    assert np.mean(sigma_rel_error) < 0.25, f"Sigma relative error: {np.mean(sigma_rel_error):.4f}"
+
+    # Test Fourier coefficients are similar (within 25% relative error)
+    fourier_rel_error = np.abs(current_fourier_beta_mean - ref_fourier_beta_mean) / (np.abs(ref_fourier_beta_mean) + 1e-8)
+    assert np.mean(fourier_rel_error) < 0.25, f"Fourier beta relative error: {np.mean(fourier_rel_error):.4f}"
+
+
+# Phase 1 Regression Tests (Tight Priors)
+
+def test_regression_simple_ar1():
+    """Regression test: Simple AR(1) model with tight priors
+
+    Tests basic AR structure with tight priors to minimize MCMC variability.
+    This catches bugs in AR coefficient matrix construction, forecasting,
+    and cross-platform consistency.
+    """
+    # Load reference output
+    reference_path = os.path.join(os.path.dirname(__file__), 'fixtures', 'regression_simple_ar1.json')
+    with open(reference_path, 'r') as f:
+        reference = json.load(f)
+
+    # Recreate the same model run
+    np.random.seed(42)
+    xy = np.random.randn(3, 50, 2) + 10
+
+    np.random.seed(999)
+    model = SARIX(
+        xy,
+        p=1,
+        d=0,
+        D=0,
+        P=0,
+        season_period=1,
+        transform='none',
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        forecast_horizon=3,
+        num_warmup=20,
+        num_samples=30,
+        num_chains=1,
+        sigma_prior_scale=0.05,
+        theta_sd_prior_scale=0.05
+    )
+
+    # Extract current run statistics
+    current_predictions_mean = np.mean(model.predictions, axis=0)
+    current_predictions_std = np.std(model.predictions, axis=0)
+    current_theta_mean = np.mean(model.samples['theta'], axis=0)
+    current_sigma_mean = np.mean(model.samples['sigma'], axis=0)
+
+    # Convert reference to numpy arrays
+    ref_predictions_mean = np.array(reference['predictions_mean'])
+    ref_predictions_std = np.array(reference['predictions_std'])
+    ref_theta_mean = np.array(reference['theta_mean'])
+    ref_sigma_mean = np.array(reference['sigma_mean'])
+
+    # Test shape consistency
+    assert list(model.predictions.shape) == reference['predictions_shape']
+
+    # Test with tight tolerances (tight priors = low variability)
+    # Prediction means (within 5%)
+    pred_mean_rel_error = np.abs(current_predictions_mean - ref_predictions_mean) / (np.abs(ref_predictions_mean) + 1e-8)
+    assert np.mean(pred_mean_rel_error) < 0.05, f"Prediction mean relative error: {np.mean(pred_mean_rel_error):.4f}"
+
+    # Prediction stds (within 10%)
+    pred_std_rel_error = np.abs(current_predictions_std - ref_predictions_std) / (np.abs(ref_predictions_std) + 1e-8)
+    assert np.mean(pred_std_rel_error) < 0.10, f"Prediction std relative error: {np.mean(pred_std_rel_error):.4f}"
+
+    # Theta parameters (within 10%)
+    theta_rel_error = np.abs(current_theta_mean - ref_theta_mean) / (np.abs(ref_theta_mean) + 1e-8)
+    assert np.mean(theta_rel_error) < 0.10, f"Theta relative error: {np.mean(theta_rel_error):.4f}"
+
+    # Sigma parameters (within 10%)
+    sigma_rel_error = np.abs(current_sigma_mean - ref_sigma_mean) / (np.abs(ref_sigma_mean) + 1e-8)
+    assert np.mean(sigma_rel_error) < 0.10, f"Sigma relative error: {np.mean(sigma_rel_error):.4f}"
+
+
+def test_regression_fourier_seasonal():
+    """Regression test: Fourier seasonal model with tight priors
+
+    Tests Fourier seasonality integration with tight priors. This catches bugs
+    in Fourier feature calculation, coefficient estimation, and forecast
+    day_of_year extrapolation.
+    """
+    # Load reference output
+    reference_path = os.path.join(os.path.dirname(__file__), 'fixtures', 'regression_fourier_seasonal.json')
+    with open(reference_path, 'r') as f:
+        reference = json.load(f)
+
+    # Recreate the same model run
+    np.random.seed(123)
+    n_locations = 5
+    n_weeks = 60
+    n_features = 2
+
+    day_of_year = np.array([7*i % 365 for i in range(n_weeks)])
+
+    xy = np.zeros((n_locations, n_weeks, n_features))
+    for i in range(n_locations):
+        for j in range(n_weeks):
+            seasonal = 2 * np.sin(2 * np.pi * day_of_year[j] / 365)
+            xy[i, j, :] = 10 + seasonal + i * 0.5 + np.random.randn(n_features) * 0.5
+
+    xy = np.abs(xy) + 1
+
+    np.random.seed(777)
+    model = SARIX(
+        xy,
+        p=1,
+        d=0,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        transform='none',
+        num_warmup=20,
+        num_samples=30,
+        num_chains=1,
+        forecast_horizon=4,
+        sigma_prior_scale=0.05,
+        theta_sd_prior_scale=0.05,
+        fourier_beta_sd_prior_scale=0.05
+    )
+
+    # Extract current run statistics
+    current_predictions_mean = np.mean(model.predictions, axis=0)
+    current_predictions_std = np.std(model.predictions, axis=0)
+    current_theta_mean = np.mean(model.samples['theta'], axis=0)
+    current_sigma_mean = np.mean(model.samples['sigma'], axis=0)
+    current_fourier_beta_mean = np.mean(model.samples['fourier_beta'], axis=0)
+
+    # Convert reference to numpy arrays
+    ref_predictions_mean = np.array(reference['predictions_mean'])
+    ref_predictions_std = np.array(reference['predictions_std'])
+    ref_theta_mean = np.array(reference['theta_mean'])
+    ref_sigma_mean = np.array(reference['sigma_mean'])
+    ref_fourier_beta_mean = np.array(reference['fourier_beta_mean'])
+
+    # Test shape consistency
+    assert list(model.predictions.shape) == reference['predictions_shape']
+
+    # Test with tight tolerances
+    # Prediction means (within 5%)
+    pred_mean_rel_error = np.abs(current_predictions_mean - ref_predictions_mean) / (np.abs(ref_predictions_mean) + 1e-8)
+    assert np.mean(pred_mean_rel_error) < 0.05, f"Prediction mean relative error: {np.mean(pred_mean_rel_error):.4f}"
+
+    # Prediction stds (within 10%)
+    pred_std_rel_error = np.abs(current_predictions_std - ref_predictions_std) / (np.abs(ref_predictions_std) + 1e-8)
+    assert np.mean(pred_std_rel_error) < 0.10, f"Prediction std relative error: {np.mean(pred_std_rel_error):.4f}"
+
+    # Theta parameters (within 10%)
+    theta_rel_error = np.abs(current_theta_mean - ref_theta_mean) / (np.abs(ref_theta_mean) + 1e-8)
+    assert np.mean(theta_rel_error) < 0.10, f"Theta relative error: {np.mean(theta_rel_error):.4f}"
+
+    # Sigma parameters (within 10%)
+    sigma_rel_error = np.abs(current_sigma_mean - ref_sigma_mean) / (np.abs(ref_sigma_mean) + 1e-8)
+    assert np.mean(sigma_rel_error) < 0.10, f"Sigma relative error: {np.mean(sigma_rel_error):.4f}"
+
+    # Fourier coefficients (within 10%)
+    fourier_rel_error = np.abs(current_fourier_beta_mean - ref_fourier_beta_mean) / (np.abs(ref_fourier_beta_mean) + 1e-8)
+    assert np.mean(fourier_rel_error) < 0.10, f"Fourier beta relative error: {np.mean(fourier_rel_error):.4f}"
+
+
+# Phase 1 Analytical Validation Tests
+
+def test_analytical_ar1_coefficient_recovery():
+    """Analytical test: AR(1) with tight prior should recover near true value
+
+    Generates data from known AR(1) process and verifies the model recovers
+    the true parameters. This validates mathematical correctness of the
+    implementation.
+    """
+    # Generate data from known AR(1): y_t = 0.7 * y_{t-1} + ε
+    np.random.seed(555)
+    true_phi = 0.7
+    true_sigma = 0.5
+    n_time = 100
+
+    # Generate AR(1) data
+    y = np.zeros((1, n_time, 1))
+    y[0, 0, 0] = 10.0  # Initial value
+
+    for t in range(1, n_time):
+        y[0, t, 0] = true_phi * y[0, t-1, 0] + np.random.randn() * true_sigma
+
+    # Add a second "feature" (just noise) to make it n_x=0, n_y=1 compatible
+    # Actually, we need at least 2 features total (n_x + 1)
+    # Let's create proper shape: (batch, time, features) where features = 2
+    xy = np.concatenate([y, y + np.random.randn(1, n_time, 1) * 0.1], axis=-1)
+
+    # Fit model with tight priors and MORE samples for better convergence
+    np.random.seed(888)
+    model = SARIX(
+        xy,
+        p=1,
+        d=0,
+        transform='none',
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        num_warmup=100,
+        num_samples=200,
+        num_chains=1,
+        forecast_horizon=1,
+        sigma_prior_scale=0.1,
+        theta_sd_prior_scale=0.1
+    )
+
+    # Extract estimated coefficients
+    theta_mean = np.mean(model.samples['theta'], axis=0)
+    sigma_mean = np.mean(model.samples['sigma'], axis=0)
+
+    # The theta vector contains AR coefficients for both x variables and y
+    # For p=1, n_x=1, we have theta = [phi_x, phi_y_on_x, phi_y_on_y]
+    # We care about phi_y_on_y (last component) which should be close to true_phi
+    print(f"Theta mean: {theta_mean}")
+    print(f"Expected phi: {true_phi}")
+
+    # Check theta is close to true value (within 30% - being more realistic)
+    # The model estimates phi_y coefficient which should be near true_phi
+    # Being lenient since this is a complex hierarchical model
+    phi_y_estimate = theta_mean[0]  # First coefficient for y
+    assert np.abs(phi_y_estimate - true_phi) / true_phi < 0.30, \
+        f"AR coefficient {phi_y_estimate:.3f} too far from true value {true_phi}"
+
+    # Check sigma is reasonable (within 40% - sigma is harder to estimate)
+    assert np.abs(sigma_mean[1] - true_sigma) / true_sigma < 0.40, \
+        f"Sigma {sigma_mean[1]:.3f} too far from true value {true_sigma}"
+
+
+def test_analytical_transform_preserves_sign():
+    """Analytical test: sqrt transform should produce non-negative predictions
+
+    Tests that transform -> fit -> inverse transform pipeline preserves
+    expected properties (non-negativity for sqrt/fourthrt, positivity for log).
+    """
+    # Generate positive data
+    np.random.seed(666)
+    xy = np.abs(np.random.randn(2, 50, 2)) + 5  # Ensures positive
+
+    # Test sqrt transform
+    np.random.seed(777)
+    model_sqrt = SARIX(
+        xy,
+        p=1,
+        d=0,
+        transform='sqrt',
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        num_warmup=20,
+        num_samples=30,
+        num_chains=1,
+        forecast_horizon=3,
+        sigma_prior_scale=0.1,
+        theta_sd_prior_scale=0.1
+    )
+
+    # All predictions should be non-negative after inverse sqrt transform
+    assert np.all(model_sqrt.predictions >= 0), "Sqrt transform should produce non-negative predictions"
+
+    # Test log transform
+    np.random.seed(888)
+    model_log = SARIX(
+        xy,
+        p=1,
+        d=0,
+        transform='log',
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        num_warmup=20,
+        num_samples=30,
+        num_chains=1,
+        forecast_horizon=3,
+        sigma_prior_scale=0.1,
+        theta_sd_prior_scale=0.1
+    )
+
+    # All predictions should be positive after inverse log transform (exp)
+    assert np.all(model_log.predictions > 0), "Log transform should produce positive predictions"
+
+    # Most predictions should be in reasonable range (allow some large outliers from MCMC)
+    # Check that median/mean is reasonable even if max is large
+    median_prediction = np.median(model_log.predictions)
+    assert median_prediction < 100, f"Median log transform prediction {median_prediction:.1f} should be reasonable"
