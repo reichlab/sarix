@@ -1,7 +1,7 @@
 import numpy as np
 import json
 import os
-from sarixfourier.sarix_fourier import SARIX, diff, inv_diff
+from sarix.sarix import SARIX, diff, inv_diff
 
 def test_diff_simple():
     """Test basic differencing operation"""
@@ -793,7 +793,7 @@ def test_full_pipeline_complex():
 
 def test_fourier_feature_calculation():
     """Test that Fourier features are calculated correctly"""
-    from sarixfourier.sarix_fourier import SARIX
+    from sarix.sarix import SARIX
 
     # Create simple day-of-year array
     day_of_year = np.array([0, 91, 182, 273])  # Roughly quarterly
