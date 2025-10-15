@@ -6,7 +6,7 @@ MCMC sampling variability. These references are used for regression testing
 to catch bugs when modifying the model implementation.
 """
 import numpy as np
-from sarixfourier.sarix_fourier import SARIX
+from sarix.sarix import SARIX
 import json
 import sys
 
