@@ -1201,8 +1201,8 @@ wheels = [
 ]
 
 [[package]]
-name = "sarixfourier"
-version = "0.1.0"
+name = "sarix"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "iddata" },
