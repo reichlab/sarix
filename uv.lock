@@ -385,7 +385,7 @@ wheels = [
 [[package]]
 name = "iddata"
 version = "0.0.1"
-source = { git = "https://github.com/reichlab/iddata#c5975648ba30e9a362a0854b7d7350d619b9d1e1" }
+source = { git = "https://github.com/reichlab/iddata#c28849b2a02ab84e2f82876f16fee2ac60814877" }
 dependencies = [
     { name = "numpy" },
     { name = "pandas" },
