@@ -830,6 +830,7 @@ def test_fourier_basic_instantiation():
         p=1,
         day_of_year=day_of_year,
         fourier_K=2,
+        fourier_pooling='none',
         num_warmup=10,
         num_samples=10,
         num_chains=1,
@@ -855,14 +856,14 @@ def test_fourier_validation():
 
     # Should raise error if fourier_K > 0 but day_of_year not provided
     try:
-        model = SARIX(xy, fourier_K=2, num_warmup=5, num_samples=5, num_chains=1)
+        model = SARIX(xy, fourier_K=2, fourier_pooling='shared', num_warmup=5, num_samples=5, num_chains=1)
         assert False, "Should have raised ValueError"
     except ValueError as e:
         assert "day_of_year must be provided" in str(e)
 
     # Should raise error if day_of_year length doesn't match
     try:
-        model = SARIX(xy, day_of_year=np.arange(10), fourier_K=2,
+        model = SARIX(xy, day_of_year=np.arange(10), fourier_K=2, fourier_pooling='shared',
                       num_warmup=5, num_samples=5, num_chains=1)
         assert False, "Should have raised ValueError"
     except ValueError as e:
@@ -885,6 +886,7 @@ def test_fourier_sample_structure():
         p=1,
         day_of_year=day_of_year,
         fourier_K=K,
+        fourier_pooling='none',
         num_warmup=10,
         num_samples=num_samples,
         num_chains=1,
@@ -912,6 +914,7 @@ def test_fourier_with_differencing():
         d=1,
         day_of_year=day_of_year,
         fourier_K=2,
+        fourier_pooling='none',
         transform='sqrt',
         num_warmup=10,
         num_samples=10,
@@ -943,6 +946,7 @@ def test_fourier_forecast_extrapolation():
         p=1,
         day_of_year=day_of_year,
         fourier_K=2,
+        fourier_pooling='none',
         num_warmup=10,
         num_samples=10,
         num_chains=1,
@@ -981,6 +985,7 @@ def test_fourier_realistic_epidemic_data():
         p=2,
         day_of_year=day_of_year,
         fourier_K=3,  # 3 harmonics to capture seasonality
+        fourier_pooling='shared',
         theta_pooling='shared',
         sigma_pooling='shared',
         transform='none',
@@ -1133,6 +1138,7 @@ def test_cross_platform_fourier_reference():
         d=0,
         day_of_year=day_of_year,
         fourier_K=2,
+        fourier_pooling='none',  # Use 'none' to match original reference data
         theta_pooling='shared',
         sigma_pooling='shared',
         transform='sqrt',
@@ -1391,3 +1397,393 @@ def test_analytical_transform_preserves_sign():
     # Check that median/mean is reasonable even if max is large
     median_prediction = np.median(model_log.predictions)
     assert median_prediction < 100, f"Median log transform prediction {median_prediction:.1f} should be reasonable"
+
+
+# Fourier Pooling Tests
+
+def test_fourier_pooling_required_when_K_positive():
+    """Test that fourier_pooling is required when fourier_K > 0"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+    day_of_year = np.arange(0, 20 * 7, 7) % 365
+
+    # Should raise error if fourier_pooling not specified
+    try:
+        model = SARIX(
+            xy,
+            day_of_year=day_of_year,
+            fourier_K=2,
+            # fourier_pooling missing!
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "fourier_pooling must be specified when fourier_K > 0" in str(e)
+
+
+def test_fourier_pooling_forbidden_when_K_zero():
+    """Test that fourier_pooling should not be specified when fourier_K=0"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    # Should raise error if fourier_pooling specified with fourier_K=0
+    try:
+        model = SARIX(
+            xy,
+            fourier_K=0,
+            fourier_pooling='shared',  # Should not be specified!
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "fourier_pooling should not be specified when fourier_K=0" in str(e)
+
+
+def test_fourier_pooling_invalid_value():
+    """Test that invalid fourier_pooling values are rejected"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+    day_of_year = np.arange(0, 20 * 7, 7) % 365
+
+    # Should raise error for invalid pooling value
+    try:
+        model = SARIX(
+            xy,
+            day_of_year=day_of_year,
+            fourier_K=2,
+            fourier_pooling='invalid',  # Invalid value
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "fourier_pooling must be 'none' or 'shared'" in str(e)
+
+
+def test_fourier_pooling_none():
+    """Test Fourier with fourier_pooling='none' (unpooled)"""
+    np.random.seed(42)
+    batch_size = 3
+    n_weeks = 52
+    n_features = 2
+    xy = np.random.randn(batch_size, n_weeks, n_features) + 10
+    day_of_year = np.arange(0, n_weeks * 7, 7) % 365
+
+    num_samples = 15
+    K = 2
+    model = SARIX(
+        xy,
+        p=1,
+        day_of_year=day_of_year,
+        fourier_K=K,
+        fourier_pooling='none',  # Unpooled
+        num_warmup=10,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # fourier_beta should have batch dimension with 'none' pooling
+    # Shape: (num_samples, batch_size, n_x+1, 2*K)
+    assert 'fourier_beta' in model.samples
+    assert model.samples['fourier_beta'].shape == (num_samples, batch_size, n_features, 2*K)
+
+    # Predictions should work
+    assert model.predictions is not None
+    assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
+
+
+def test_fourier_pooling_shared():
+    """Test Fourier with fourier_pooling='shared' (pooled across batches)"""
+    np.random.seed(42)
+    batch_size = 3
+    n_weeks = 52
+    n_features = 2
+    xy = np.random.randn(batch_size, n_weeks, n_features) + 10
+    day_of_year = np.arange(0, n_weeks * 7, 7) % 365
+
+    num_samples = 15
+    K = 2
+    model = SARIX(
+        xy,
+        p=1,
+        day_of_year=day_of_year,
+        fourier_K=K,
+        fourier_pooling='shared',  # Pooled!
+        num_warmup=10,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # fourier_beta should NOT have batch dimension with 'shared' pooling
+    # Shape: (num_samples, n_x+1, 2*K)
+    assert 'fourier_beta' in model.samples
+    assert model.samples['fourier_beta'].shape == (num_samples, n_features, 2*K)
+
+    # Predictions should work correctly (broadcast across batches)
+    assert model.predictions is not None
+    assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
+
+
+def test_fourier_pooling_with_multiple_batches():
+    """Test Fourier pooling with realistic batch sizes"""
+    np.random.seed(42)
+    n_locations = 10
+    n_weeks = 52
+    n_features = 2
+    xy = np.random.randn(n_locations, n_weeks, n_features) + 10
+    day_of_year = np.arange(0, n_weeks * 7, 7) % 365
+
+    K = 3
+
+    # Test with 'none' pooling
+    model_none = SARIX(
+        xy.copy(),
+        p=1,
+        day_of_year=day_of_year,
+        fourier_K=K,
+        fourier_pooling='none',
+        num_warmup=5,
+        num_samples=10,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # Should have separate Fourier coefficients per location
+    assert model_none.samples['fourier_beta'].shape[1] == n_locations
+
+    # Test with 'shared' pooling
+    model_shared = SARIX(
+        xy.copy(),
+        p=1,
+        day_of_year=day_of_year,
+        fourier_K=K,
+        fourier_pooling='shared',
+        num_warmup=5,
+        num_samples=10,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # Should NOT have batch dimension
+    assert model_shared.samples['fourier_beta'].ndim == 3  # (samples, n_features, 2*K)
+    assert model_shared.samples['fourier_beta'].shape == (10, n_features, 2*K)
+
+    # Both should produce valid predictions
+    assert model_none.predictions.shape == (10, n_locations, 2, n_features)
+    assert model_shared.predictions.shape == (10, n_locations, 2, n_features)
+
+
+def test_backwards_compatibility_no_fourier():
+    """Test backwards compatibility: existing code without Fourier works unchanged"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    # This should work without specifying fourier_pooling
+    model = SARIX(
+        xy,
+        p=1,
+        fourier_K=0,  # No Fourier terms
+        # fourier_pooling not needed
+        num_warmup=10,
+        num_samples=10,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # Should work fine
+    assert model.predictions is not None
+    assert 'fourier_beta' not in model.samples
+
+
+def test_fourier_pooling_with_transforms():
+    """Test fourier_pooling='shared' with data transforms"""
+    np.random.seed(42)
+    xy = np.abs(np.random.randn(3, 52, 2)) + 5
+    day_of_year = np.arange(0, 52 * 7, 7) % 365
+
+    for transform in ['sqrt', 'log', 'fourthrt']:
+        model = SARIX(
+            xy.copy(),
+            p=1,
+            day_of_year=day_of_year,
+            fourier_K=2,
+            fourier_pooling='shared',
+            transform=transform,
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1,
+            forecast_horizon=2
+        )
+
+        # Should produce valid predictions
+        assert model.predictions is not None
+        if transform in ['sqrt', 'fourthrt']:
+            assert np.all(model.predictions >= 0)
+        elif transform == 'log':
+            assert np.all(model.predictions > 0)
+
+
+def test_fourier_pooling_with_differencing():
+    """Test Fourier pooling with differencing"""
+    np.random.seed(42)
+    xy = np.random.randn(3, 60, 2) + 10
+    day_of_year = np.arange(0, 60 * 7, 7) % 365
+
+    # Test with ordinary differencing
+    model_d = SARIX(
+        xy.copy(),
+        p=1,
+        d=1,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        fourier_pooling='shared',
+        num_warmup=5,
+        num_samples=5,
+        num_chains=1,
+        forecast_horizon=2
+    )
+    assert model_d.predictions is not None
+
+    # Test with seasonal differencing
+    model_D = SARIX(
+        xy.copy(),
+        p=1,
+        P=1,
+        D=1,
+        season_period=7,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        fourier_pooling='shared',
+        num_warmup=5,
+        num_samples=5,
+        num_chains=1,
+        forecast_horizon=2
+    )
+    assert model_D.predictions is not None
+
+
+def test_fourier_pooling_mixed_with_theta_sigma():
+    """Test all combinations of pooling for theta, sigma, and Fourier"""
+    np.random.seed(42)
+    batch_size = 3
+    xy = np.random.randn(batch_size, 52, 2) + 10
+    day_of_year = np.arange(0, 52 * 7, 7) % 365
+
+    num_samples = 10
+
+    # Test: all shared
+    model_all_shared = SARIX(
+        xy.copy(),
+        p=1,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        fourier_pooling='shared',
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # All should have no batch dimensions
+    assert model_all_shared.samples['theta'].ndim == 2  # (samples, n_theta)
+    assert model_all_shared.samples['sigma'].ndim == 2  # (samples, n_features)
+    assert model_all_shared.samples['fourier_beta'].ndim == 3  # (samples, n_features, 2*K)
+
+    # Test: all unpooled
+    model_all_none = SARIX(
+        xy.copy(),
+        p=1,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        theta_pooling='none',
+        sigma_pooling='none',
+        fourier_pooling='none',
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # All should have batch dimensions
+    assert model_all_none.samples['theta'].shape[1] == batch_size
+    assert model_all_none.samples['sigma'].shape[1] == batch_size
+    assert model_all_none.samples['fourier_beta'].shape[1] == batch_size
+
+    # Test: mixed (theta shared, sigma none, fourier shared)
+    model_mixed = SARIX(
+        xy.copy(),
+        p=1,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        theta_pooling='shared',
+        sigma_pooling='none',
+        fourier_pooling='shared',
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # theta and fourier should have no batch dim, sigma should have batch dim
+    assert model_mixed.samples['theta'].ndim == 2
+    assert model_mixed.samples['sigma'].shape[1] == batch_size
+    assert model_mixed.samples['fourier_beta'].ndim == 3
+
+    # All should produce valid predictions
+    assert model_all_shared.predictions.shape == (num_samples, batch_size, 2, 2)
+    assert model_all_none.predictions.shape == (num_samples, batch_size, 2, 2)
+    assert model_mixed.predictions.shape == (num_samples, batch_size, 2, 2)
+
+
+def test_fourier_shared_predictions_work_correctly():
+    """Test that shared Fourier pooling produces reasonable predictions"""
+    np.random.seed(42)
+    n_locations = 5
+    n_weeks = 52
+    n_features = 2
+
+    # Generate synthetic seasonal data with positive values
+    day_of_year = np.array([7*i % 365 for i in range(n_weeks)])
+    xy = np.zeros((n_locations, n_weeks, n_features))
+
+    for i in range(n_locations):
+        for j in range(n_weeks):
+            # Base level + seasonal component + noise
+            seasonal = 3 * np.sin(2 * np.pi * day_of_year[j] / 365)
+            xy[i, j, :] = 15 + seasonal + i * 0.5 + np.random.randn(n_features) * 0.3
+
+    xy = np.abs(xy) + 5  # Ensure well above zero
+
+    model = SARIX(
+        xy,
+        p=1,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        fourier_pooling='shared',
+        theta_pooling='shared',
+        sigma_pooling='shared',
+        transform='sqrt',  # Use sqrt transform to help keep predictions positive
+        num_warmup=10,
+        num_samples=10,
+        num_chains=1,
+        forecast_horizon=4
+    )
+
+    # Should produce predictions for all locations
+    assert model.predictions.shape == (10, n_locations, 4, n_features)
+
+    # Predictions should be reasonable (not NaN or inf)
+    assert not np.any(np.isnan(model.predictions))
+    assert not np.any(np.isinf(model.predictions))
+
+    # All predictions should be non-negative after sqrt inverse transform
+    assert np.all(model.predictions >= 0)
