@@ -205,6 +205,12 @@ class SARIX():
         Design note: Fourier terms are applied to the data BEFORE differencing
         to capture seasonal patterns in levels rather than changes.
 
+    fourier_pooling : {'none', 'shared'}, required if fourier_K > 0
+        How to share Fourier regression coefficients across batches.
+        - 'none': Separate coefficients per batch/location
+        - 'shared': Single set of coefficients shared across all batches
+        Required when fourier_K > 0, must be None when fourier_K=0.
+
     Notes
     -----
     **Fourier Seasonality:**
@@ -234,7 +240,7 @@ class SARIX():
     >>> dates = pd.date_range('2020-01-01', periods=52, freq='W')
     >>> day_of_year = dates.dayofyear.values
     >>> model = SARIX(xy, p=2, day_of_year=day_of_year, fourier_K=3,
-    ...               forecast_horizon=4)
+    ...               fourier_pooling='shared', forecast_horizon=4)
     """
     def __init__(self,
                  xy,
@@ -250,6 +256,7 @@ class SARIX():
                  num_warmup=1000, num_samples=1000, num_chains=1,
                  day_of_year=None,
                  fourier_K=0,
+                 fourier_pooling=None,
                  sigma_prior_scale=1.0,
                  theta_sd_prior_scale=1.0,
                  fourier_beta_sd_prior_scale=1.0):
@@ -269,6 +276,7 @@ class SARIX():
         self.num_samples = num_samples
         self.num_chains = num_chains
         self.fourier_K = fourier_K
+        self.fourier_pooling = fourier_pooling
         self.day_of_year = day_of_year
         self.sigma_prior_scale = sigma_prior_scale
         self.theta_sd_prior_scale = theta_sd_prior_scale
@@ -279,6 +287,12 @@ class SARIX():
             raise ValueError("day_of_year must be provided when fourier_K > 0")
         if fourier_K > 0 and len(day_of_year) != xy.shape[-2]:
             raise ValueError(f"day_of_year length ({len(day_of_year)}) must match time dimension ({xy.shape[-2]})")
+        if fourier_K > 0 and fourier_pooling is None:
+            raise ValueError("fourier_pooling must be specified when fourier_K > 0")
+        if fourier_K == 0 and fourier_pooling is not None:
+            raise ValueError("fourier_pooling should not be specified when fourier_K=0")
+        if fourier_pooling is not None and fourier_pooling not in ['none', 'shared']:
+            raise ValueError("fourier_pooling must be 'none' or 'shared'")
 
         # set up batch shapes for parameter pooling
         # xy has shape batch_shape + (T, n_x + 1)
@@ -302,8 +316,16 @@ class SARIX():
         else:
             raise ValueError("sigma_pooling must be 'none' or 'shared'")
 
-        # Fourier terms are always unpooled (separate per location) for now
-        self.fourier_batch_shape = batch_shape
+        if fourier_K > 0:
+            if fourier_pooling == 'none':
+                # separate parameters per batch
+                self.fourier_batch_shape = batch_shape
+            elif fourier_pooling == 'shared':
+                # no batches for fourier; will broadcast to share across all batches
+                self.fourier_batch_shape = ()
+        else:
+            # Not using Fourier terms, but set for consistency
+            self.fourier_batch_shape = batch_shape
 
         # do transformation
         self.xy_orig = xy.copy()
@@ -611,6 +633,15 @@ class SARIX():
             fourier_beta = self.samples['fourier_beta']
             # fourier_beta has shape (num_samples, fourier_batch_shape..., n_x+1, 2*K)
             # Need to match batch_shape
+            fourier_batch_shape = fourier_beta.shape[:-2]
+
+            if self.fourier_pooling == 'shared':
+                # goal is shape fourier_batch_shape + xy_batch_shape + (n_x+1, 2*K)
+                # first insert 1's corresponding to xy_batch_shape, then broadcast
+                ones = (1,) * len(xy_batch_shape)
+                fourier_beta = fourier_beta.reshape(fourier_batch_shape + ones + fourier_beta.shape[-2:])
+                target = fourier_batch_shape + xy_batch_shape + fourier_beta.shape[-2:]
+                fourier_beta = jnp.broadcast_to(fourier_beta, target)
 
             # Generate forecast day-of-year values
             # Extrapolate from last observed day, assuming 7-day spacing (weekly data)
