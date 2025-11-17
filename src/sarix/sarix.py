@@ -390,6 +390,19 @@ class SARIX():
         are then a times the log multipliers, so the prior scale should be
         chosen on the scale of xy (see Notes).
 
+    **Innovation distribution**
+
+    innovation_dist : {'normal', 't'}, default='normal'
+        Distribution of the innovations.
+        - 'normal': multivariate normal.
+        - 't': multivariate Student's t, with heavier tails.
+
+    innovation_df_prior_scale : float, default=10.0
+        Scale of the Gamma(2, 1 / innovation_df_prior_scale) prior on the
+        degrees of freedom of the t innovations, which has mean
+        2 * innovation_df_prior_scale. The degrees of freedom are estimated
+        separately for each batch. Ignored when innovation_dist='normal'.
+
     **Forecasting and MCMC**
 
     forecast_horizon : int, default=1
@@ -517,6 +530,9 @@ class SARIX():
                  intercept_mu_prior_scale=None,
                  calendar_effect_sd_prior_scale=1.0,
                  calendar_effect_mu_prior_scale=1.0,
+                 # innovation distribution
+                 innovation_dist='normal',
+                 innovation_df_prior_scale=10.0,
                  # forecasting and MCMC
                  forecast_horizon=1,
                  num_warmup=1000,
@@ -563,6 +579,12 @@ class SARIX():
         if onp.any(mu_scale <= 0):
             raise ValueError("calendar_effect_mu_prior_scale must be positive")
         self.calendar_effect_mu_prior_scale = onp.broadcast_to(mu_scale, (xy.shape[-1],))
+        self.innovation_dist = innovation_dist
+        self.innovation_df_prior_scale = innovation_df_prior_scale
+
+        # Validate innovation distribution parameters
+        if innovation_dist not in ['normal', 't']:
+            raise ValueError("innovation_dist must be 'normal' or 't'")
 
         # Validate Fourier parameters
         if fourier_K > 0 and day_of_year is None:
@@ -1230,13 +1252,38 @@ class SARIX():
         # with shape (batch_shape, T - self.max_lag, n_x + 1)
         step_innovations = xy[..., self.max_lag:, :] - step_means
 
-        # sample innovations
-        numpyro.sample(
-            "step_innovations",
-            dist.MultivariateNormal(
-                loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_chol),
-            obs=step_innovations
-        )
+        # sample innovations with chosen distribution
+        if self.innovation_dist == 'normal':
+            # Standard multivariate normal innovations
+            numpyro.sample(
+                "step_innovations",
+                dist.MultivariateNormal(
+                    loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_chol),
+                obs=step_innovations
+            )
+        elif self.innovation_dist == 't':
+            # Student's t innovations with estimated degrees of freedom (unpooled by location)
+            # Sample df with a Gamma(2, 1/scale) prior for each location
+            # This has mean 2*scale and encourages df > 2 for finite variance
+            # batch_shape determines separate df per location
+            batch_shape = xy.shape[:-2]
+            innovation_df = numpyro.sample(
+                "innovation_df",
+                dist.Gamma(2.0, 1.0 / self.innovation_df_prior_scale).expand(batch_shape)
+            )
+            # innovation_df has shape batch_shape = (n_locations,)
+            # Sigma_chol has shape batch_shape + (1, n_x+1, n_x+1) due to time broadcast dimension
+            # Need to expand innovation_df to match: batch_shape + (1,) for time dimension
+            if len(xy.shape) > 2:
+                innovation_df = jnp.expand_dims(innovation_df, -1)
+            numpyro.sample(
+                "step_innovations",
+                dist.MultivariateStudentT(
+                    df=innovation_df,
+                    loc=jnp.zeros((self.n_x + 1,)),
+                    scale_tril=Sigma_chol),
+                obs=step_innovations
+            )
 
 
     def predict(self, rng_key):
@@ -1347,10 +1394,22 @@ class SARIX():
         # we deal with this in the loop below when adding to the mean for each
         # forecast horizon by dropping the leading dimension when indexing, then
         # inserting an extra dimension at position -2 before adding.
-        innovations = dist.MultivariateNormal(
-                loc=jnp.zeros((self.n_x + 1,)),
-                scale_tril=Sigma_chol) \
-            .sample(rng_key, sample_shape=(self.forecast_horizon, ))
+        if self.innovation_dist == 'normal':
+            innovations = dist.MultivariateNormal(
+                    loc=jnp.zeros((self.n_x + 1,)),
+                    scale_tril=Sigma_chol) \
+                .sample(rng_key, sample_shape=(self.forecast_horizon, ))
+        elif self.innovation_dist == 't':
+            # Load degrees of freedom from samples (unpooled by location)
+            innovation_df = self.samples['innovation_df']
+            # innovation_df has shape (num_samples, n_locations)
+            # batch_shape is (num_samples, n_locations) from theta/sigma
+            # df should match the batch dimensions for broadcasting
+            innovations = dist.MultivariateStudentT(
+                    df=innovation_df,
+                    loc=jnp.zeros((self.n_x + 1,)),
+                    scale_tril=Sigma_chol) \
+                .sample(rng_key, sample_shape=(self.forecast_horizon, ))
 
         # generate step-ahead forecasts iteratively
         y_pred = []
