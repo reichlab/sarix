@@ -9,7 +9,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 - **Models with no autoregressive terms**: SARIX now supports `p=0` and `P=0`, where the predictive mean
-  comes only from the Fourier terms. `theta` and `theta_sd` are not sampled in this case.
+  comes only from the intercept and/or Fourier terms. `theta` and `theta_sd` are not sampled in this case.
+- **Optional intercept**: New `include_intercept` parameter adds an intercept for each variable
+  - New `intercept_pooling` parameter (`'none'` or `'shared'`), required when `include_intercept=True`
+    and must be `None` otherwise
+  - New `intercept_sd_prior_scale` parameter for the HalfCauchy prior on the intercept standard deviation
+  - The intercept is applied on the modeled scale (after transformation and differencing), so it is a
+    level with `d=0` and a drift with `d=1`
 
 ## [0.2.0] - 2025-10-15
 

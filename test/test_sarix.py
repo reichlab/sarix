@@ -1854,7 +1854,7 @@ def test_no_ar_terms_with_differencing_and_fourier():
 
 
 def test_no_ar_terms_without_other_terms():
-    """Test p=0, P=0 with no Fourier terms (innovations only)"""
+    """Test p=0, P=0 with no Fourier terms or intercept (innovations only)"""
     np.random.seed(42)
     batch_size = 2
     n_features = 2
@@ -1899,3 +1899,190 @@ def test_no_ar_terms_with_seasonal_ar():
     assert 'theta' in model.samples
     assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
     assert np.all(np.isfinite(model.predictions))
+
+
+def test_intercept_pooling_required_when_intercept_included():
+    """Test that intercept_pooling is required when include_intercept is True"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    try:
+        model = SARIX(
+            xy,
+            include_intercept=True,
+            # intercept_pooling missing!
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "intercept_pooling must be specified when include_intercept is True" in str(e)
+
+
+def test_intercept_pooling_forbidden_when_intercept_not_included():
+    """Test that intercept_pooling should not be specified when include_intercept is False"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    try:
+        model = SARIX(
+            xy,
+            include_intercept=False,
+            intercept_pooling='shared',  # Should not be specified!
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "intercept_pooling should not be specified when include_intercept is False" in str(e)
+
+
+def test_intercept_pooling_invalid_value():
+    """Test that invalid intercept_pooling values are rejected"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    try:
+        model = SARIX(
+            xy,
+            include_intercept=True,
+            intercept_pooling='invalid',  # Invalid value
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1
+        )
+        assert False, "Should have raised ValueError"
+    except ValueError as e:
+        assert "intercept_pooling must be 'none' or 'shared'" in str(e)
+
+
+def test_intercept_pooling_none():
+    """Test intercept with intercept_pooling='none' (unpooled)"""
+    np.random.seed(42)
+    batch_size = 3
+    n_features = 2
+    xy = np.random.randn(batch_size, 30, n_features) + 10
+
+    num_samples = 10
+    model = SARIX(
+        xy,
+        p=1,
+        include_intercept=True,
+        intercept_pooling='none',
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # intercept should have batch dimension with 'none' pooling
+    # Shape: (num_samples, batch_size, n_x+1)
+    assert model.samples['intercept'].shape == (num_samples, batch_size, n_features)
+    assert model.samples['intercept_sd'].shape == (num_samples, 1)
+    assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
+
+
+def test_intercept_pooling_shared():
+    """Test intercept with intercept_pooling='shared' (pooled across batches)"""
+    np.random.seed(42)
+    batch_size = 3
+    n_features = 2
+    xy = np.random.randn(batch_size, 30, n_features) + 10
+
+    num_samples = 10
+    model = SARIX(
+        xy,
+        p=1,
+        theta_pooling='shared',
+        include_intercept=True,
+        intercept_pooling='shared',
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # intercept should NOT have batch dimension with 'shared' pooling
+    # Shape: (num_samples, n_x+1)
+    assert model.samples['intercept'].shape == (num_samples, n_features)
+
+    # Predictions should broadcast across batches
+    assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
+
+
+def test_backwards_compatibility_no_intercept():
+    """Test that models without an intercept sample no intercept parameters"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    model = SARIX(
+        xy,
+        p=1,
+        num_warmup=5,
+        num_samples=5,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    assert 'intercept' not in model.samples
+    assert 'intercept_sd' not in model.samples
+
+
+def test_no_ar_terms_with_fourier_and_intercept():
+    """Test p=0 with Fourier terms and an intercept, with different pooling for each"""
+    np.random.seed(42)
+    batch_size = 3
+    n_weeks = 52
+    n_features = 2
+    xy = np.random.randn(batch_size, n_weeks, n_features) + 10
+    day_of_year = np.arange(0, n_weeks * 7, 7) % 365
+
+    num_samples = 10
+    model = SARIX(
+        xy,
+        p=0,
+        day_of_year=day_of_year,
+        fourier_K=2,
+        fourier_pooling='shared',
+        include_intercept=True,
+        intercept_pooling='none',
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=3
+    )
+
+    assert 'theta' not in model.samples
+    assert model.samples['fourier_beta'].shape == (num_samples, n_features, 4)
+    assert model.samples['intercept'].shape == (num_samples, batch_size, n_features)
+    assert model.predictions.shape == (num_samples, batch_size, 3, n_features)
+    assert np.all(np.isfinite(model.predictions))
+
+
+def test_analytical_intercept_recovers_level():
+    """Test that with p=0, d=0, the intercept recovers each location's level"""
+    np.random.seed(42)
+    levels = np.array([2.0, 5.0, 8.0])
+    n_weeks = 52
+    xy = levels[:, None, None] + 0.3 * np.random.randn(len(levels), n_weeks, 1)
+
+    model = SARIX(
+        xy,
+        p=0,
+        include_intercept=True,
+        intercept_pooling='none',
+        num_warmup=200,
+        num_samples=200,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # Posterior median intercepts should be close to the true levels
+    intercept_median = np.median(model.samples['intercept'][:, :, 0], axis=0)
+    assert np.allclose(intercept_median, levels, atol=0.3)
+
+    # Forecasts are centered on the levels too
+    pred_median = np.median(model.predictions[:, :, :, 0], axis=0)
+    assert np.allclose(pred_median, levels[:, None], atol=0.3)
