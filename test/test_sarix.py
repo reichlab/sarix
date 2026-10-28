@@ -1787,3 +1787,115 @@ def test_fourier_shared_predictions_work_correctly():
 
     # All predictions should be non-negative after sqrt inverse transform
     assert np.all(model.predictions >= 0)
+
+
+def test_no_ar_terms_with_fourier():
+    """Test p=0, P=0 (no AR terms) with Fourier terms only"""
+    np.random.seed(42)
+    batch_size = 3
+    n_weeks = 52
+    n_features = 2
+    xy = np.random.randn(batch_size, n_weeks, n_features) + 10
+    day_of_year = np.arange(0, n_weeks * 7, 7) % 365
+
+    num_samples = 10
+    for fourier_pooling in ['none', 'shared']:
+        model = SARIX(
+            xy.copy(),
+            p=0,
+            P=0,
+            day_of_year=day_of_year,
+            fourier_K=2,
+            fourier_pooling=fourier_pooling,
+            num_warmup=5,
+            num_samples=num_samples,
+            num_chains=1,
+            forecast_horizon=3
+        )
+
+        # No AR terms, so no AR parameters are sampled
+        assert model.max_lag == 0
+        assert model.update_X is None
+        assert 'theta' not in model.samples
+        assert 'theta_sd' not in model.samples
+        assert 'fourier_beta' in model.samples
+
+        assert model.predictions.shape == (num_samples, batch_size, 3, n_features)
+        assert np.all(np.isfinite(model.predictions))
+
+
+def test_no_ar_terms_with_differencing_and_fourier():
+    """Test p=0, d=1 with Fourier terms: a random walk with seasonal drift"""
+    np.random.seed(42)
+    batch_size = 3
+    n_weeks = 60
+    n_features = 2
+    xy = np.random.randn(batch_size, n_weeks, n_features) + 10
+    day_of_year = np.arange(0, n_weeks * 7, 7) % 365
+
+    num_samples = 10
+    for fourier_pooling in ['none', 'shared']:
+        model = SARIX(
+            xy.copy(),
+            p=0,
+            d=1,
+            day_of_year=day_of_year,
+            fourier_K=2,
+            fourier_pooling=fourier_pooling,
+            num_warmup=5,
+            num_samples=num_samples,
+            num_chains=1,
+            forecast_horizon=3
+        )
+
+        assert 'theta' not in model.samples
+        assert model.predictions.shape == (num_samples, batch_size, 3, n_features)
+        assert np.all(np.isfinite(model.predictions))
+
+
+def test_no_ar_terms_without_other_terms():
+    """Test p=0, P=0 with no Fourier terms (innovations only)"""
+    np.random.seed(42)
+    batch_size = 2
+    n_features = 2
+    xy = np.random.randn(batch_size, 30, n_features)
+
+    num_samples = 10
+    model = SARIX(
+        xy,
+        p=0,
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # Only the innovation standard deviations are sampled
+    assert set(model.samples.keys()) == {'sigma'}
+    assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
+    assert np.all(np.isfinite(model.predictions))
+
+
+def test_no_ar_terms_with_seasonal_ar():
+    """Test p=0 with P=1: seasonal AR terms only, so AR parameters are still sampled"""
+    np.random.seed(42)
+    batch_size = 2
+    n_features = 2
+    xy = np.random.randn(batch_size, 30, n_features) + 10
+
+    num_samples = 10
+    model = SARIX(
+        xy,
+        p=0,
+        P=1,
+        season_period=4,
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    assert model.max_lag == 4
+    assert 'theta' in model.samples
+    assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
+    assert np.all(np.isfinite(model.predictions))
