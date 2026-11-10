@@ -168,10 +168,20 @@ class SARIX():
 
     Parameters
     ----------
+    All parameters after `xy` are keyword-only.
+
+    **Data**
+
     xy : array_like
         Input data with shape (batch, time, features) or (time, features).
         The last feature dimension is treated as the target variable (y),
         and all other features are exogenous variables (x).
+
+    day_of_year : array_like, optional
+        Day-of-year values (0-365) for each time point. Required if fourier_K > 0.
+        Used to calculate Fourier seasonal features.
+
+    **Model structure**
 
     p : int, default=1
         Order of autoregressive terms (number of lags). If p=0 and P=0, the
@@ -198,17 +208,64 @@ class SARIX():
         - 'fourthrt': Fourth root transformation
         - 'log': Natural log transformation
 
+    fourier_K : int, default=0
+        Number of Fourier harmonic pairs to include for seasonal patterns.
+        If 0, no Fourier terms are included. Each harmonic pair includes
+        a sine and cosine term, so fourier_K=3 adds 6 features total.
+
+        Design note: Fourier terms are applied to the data BEFORE differencing
+        to capture seasonal patterns in levels rather than changes.
+
+    include_intercept : bool, default=False
+        Whether to include an intercept term for each variable. The intercept
+        is applied on the modeled scale, i.e. after transformation and
+        differencing: with d=0 it is a level, and with d=1 it is a drift.
+
+    **Pooling**
+
+    For all pooling arguments, the deprecated value 'none' is accepted as an
+    alias for 'unshared' and emits a FutureWarning.
+
     theta_pooling : {'unshared', 'shared'}, default='unshared'
         How to share AR coefficients across batches.
         - 'unshared': Separate parameters per batch/location
         - 'shared': Single set of parameters shared across all batches
-        For all pooling arguments, the deprecated value 'none' is accepted as
-        an alias for 'unshared' and emits a FutureWarning.
 
     sigma_pooling : {'unshared', 'shared'}, default='unshared'
         How to share innovation standard deviations across batches.
         - 'unshared': Separate parameters per batch/location
         - 'shared': Single set of parameters shared across all batches
+
+    fourier_pooling : {'unshared', 'shared'}, required if fourier_K > 0
+        How to share Fourier regression coefficients across batches.
+        - 'unshared': Separate coefficients per batch/location
+        - 'shared': Single set of coefficients shared across all batches
+        Required when fourier_K > 0, must be None when fourier_K=0.
+
+    intercept_pooling : {'unshared', 'shared'}, required if include_intercept
+        How to share intercepts across batches.
+        - 'unshared': Separate intercepts per batch/location
+        - 'shared': Single set of intercepts shared across all batches
+        Required when include_intercept is True, must be None otherwise.
+
+    **Prior scales**
+
+    sigma_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the innovation standard deviations.
+
+    theta_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the standard deviation of the AR
+        coefficients.
+
+    fourier_beta_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the standard deviation of the
+        Fourier coefficients.
+
+    intercept_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the standard deviation of the
+        intercepts.
+
+    **Forecasting and MCMC**
 
     forecast_horizon : int, default=1
         Number of time steps to forecast into the future.
@@ -221,39 +278,6 @@ class SARIX():
 
     num_chains : int, default=1
         Number of MCMC chains to run.
-
-    day_of_year : array_like, optional
-        Day-of-year values (0-365) for each time point. Required if fourier_K > 0.
-        Used to calculate Fourier seasonal features.
-
-    fourier_K : int, default=0
-        Number of Fourier harmonic pairs to include for seasonal patterns.
-        If 0, no Fourier terms are included. Each harmonic pair includes
-        a sine and cosine term, so fourier_K=3 adds 6 features total.
-
-        Design note: Fourier terms are applied to the data BEFORE differencing
-        to capture seasonal patterns in levels rather than changes.
-
-    fourier_pooling : {'unshared', 'shared'}, required if fourier_K > 0
-        How to share Fourier regression coefficients across batches.
-        - 'unshared': Separate coefficients per batch/location
-        - 'shared': Single set of coefficients shared across all batches
-        Required when fourier_K > 0, must be None when fourier_K=0.
-
-    include_intercept : bool, default=False
-        Whether to include an intercept term for each variable. The intercept
-        is applied on the modeled scale, i.e. after transformation and
-        differencing: with d=0 it is a level, and with d=1 it is a drift.
-
-    intercept_pooling : {'unshared', 'shared'}, required if include_intercept
-        How to share intercepts across batches.
-        - 'unshared': Separate intercepts per batch/location
-        - 'shared': Single set of intercepts shared across all batches
-        Required when include_intercept is True, must be None otherwise.
-
-    intercept_sd_prior_scale : float, default=1.0
-        Scale of the HalfCauchy prior on the standard deviation of the
-        intercepts.
 
     Notes
     -----
@@ -288,25 +312,33 @@ class SARIX():
     """
     def __init__(self,
                  xy,
+                 *,
+                 # data
+                 day_of_year=None,
+                 # model structure
                  p=1,
                  d=0,
                  P=0,
                  D=0,
                  season_period=1,
                  transform='none',
+                 fourier_K=0,
+                 include_intercept=False,
+                 # pooling
                  theta_pooling='unshared',
                  sigma_pooling='unshared',
-                 forecast_horizon=1,
-                 num_warmup=1000, num_samples=1000, num_chains=1,
-                 day_of_year=None,
-                 fourier_K=0,
                  fourier_pooling=None,
+                 intercept_pooling=None,
+                 # prior scales
                  sigma_prior_scale=1.0,
                  theta_sd_prior_scale=1.0,
                  fourier_beta_sd_prior_scale=1.0,
-                 include_intercept=False,
-                 intercept_pooling=None,
-                 intercept_sd_prior_scale=1.0):
+                 intercept_sd_prior_scale=1.0,
+                 # forecasting and MCMC
+                 forecast_horizon=1,
+                 num_warmup=1000,
+                 num_samples=1000,
+                 num_chains=1):
         theta_pooling = _validate_pooling(theta_pooling, 'theta_pooling')
         sigma_pooling = _validate_pooling(sigma_pooling, 'sigma_pooling')
         if fourier_pooling is not None:

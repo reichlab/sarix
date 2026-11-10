@@ -2120,6 +2120,14 @@ def test_pooling_none_is_deprecated_alias_for_unshared(pooling_arg, extra_kwargs
     assert getattr(model, batch_shape_attr) == (batch_size,)
 
 
+def test_arguments_after_xy_are_keyword_only():
+    """Test that passing model arguments positionally raises a TypeError"""
+    xy = np.random.randn(2, 20, 2) + 10
+
+    with pytest.raises(TypeError, match="positional argument"):
+        SARIX(xy, 1)
+
+
 def test_pooling_accepts_str_enum():
     """Test that str enum members (as used by idmodels) are accepted and stored as plain strings"""
 

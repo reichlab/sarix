@@ -17,6 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - The intercept is applied on the modeled scale (after transformation and differencing), so it is a
     level with `d=0` and a drift with `d=1`
 
+### Changed
+- **Breaking**: All `SARIX` constructor arguments after `xy` are now keyword-only, and they are
+  reordered into groups: data (`day_of_year`), model structure, pooling, prior scales, and
+  forecasting/MCMC settings. Code that passes these arguments by name is unaffected; code that
+  passes them by position now raises a `TypeError`.
+
 ### Deprecated
 - The `'none'` option for `theta_pooling`, `sigma_pooling`, `fourier_pooling` and `intercept_pooling`
   is renamed to `'unshared'`, to avoid confusion with Python's `None` (which `fourier_pooling` and
