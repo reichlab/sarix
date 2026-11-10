@@ -5,6 +5,7 @@ Local Trend
 
 import os
 import time
+import warnings
 
 from functools import reduce
 
@@ -134,6 +135,30 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
 
 
 
+POOLING_OPTIONS = ('unshared', 'shared')
+
+
+def _validate_pooling(value, name):
+    """
+    Validate a pooling option and return it as a plain string.
+
+    The deprecated value 'none' is accepted as an alias for 'unshared' with a
+    FutureWarning.
+    """
+    if value == 'none':
+        warnings.warn(
+            f"{name}='none' is deprecated and will be removed in a future "
+            f"release; use {name}='unshared' instead.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        return 'unshared'
+    if value not in POOLING_OPTIONS:
+        raise ValueError(f"{name} must be 'unshared' or 'shared'")
+    # return the canonical plain string (value may be a str enum member)
+    return POOLING_OPTIONS[POOLING_OPTIONS.index(value)]
+
+
 class SARIX():
     """
     Seasonal AutoRegressive Integrated model with eXogenous variables (SARIX).
@@ -173,14 +198,16 @@ class SARIX():
         - 'fourthrt': Fourth root transformation
         - 'log': Natural log transformation
 
-    theta_pooling : {'none', 'shared'}, default='none'
+    theta_pooling : {'unshared', 'shared'}, default='unshared'
         How to share AR coefficients across batches.
-        - 'none': Separate parameters per batch/location
+        - 'unshared': Separate parameters per batch/location
         - 'shared': Single set of parameters shared across all batches
+        For all pooling arguments, the deprecated value 'none' is accepted as
+        an alias for 'unshared' and emits a FutureWarning.
 
-    sigma_pooling : {'none', 'shared'}, default='none'
+    sigma_pooling : {'unshared', 'shared'}, default='unshared'
         How to share innovation standard deviations across batches.
-        - 'none': Separate parameters per batch/location
+        - 'unshared': Separate parameters per batch/location
         - 'shared': Single set of parameters shared across all batches
 
     forecast_horizon : int, default=1
@@ -207,9 +234,9 @@ class SARIX():
         Design note: Fourier terms are applied to the data BEFORE differencing
         to capture seasonal patterns in levels rather than changes.
 
-    fourier_pooling : {'none', 'shared'}, required if fourier_K > 0
+    fourier_pooling : {'unshared', 'shared'}, required if fourier_K > 0
         How to share Fourier regression coefficients across batches.
-        - 'none': Separate coefficients per batch/location
+        - 'unshared': Separate coefficients per batch/location
         - 'shared': Single set of coefficients shared across all batches
         Required when fourier_K > 0, must be None when fourier_K=0.
 
@@ -218,9 +245,9 @@ class SARIX():
         is applied on the modeled scale, i.e. after transformation and
         differencing: with d=0 it is a level, and with d=1 it is a drift.
 
-    intercept_pooling : {'none', 'shared'}, required if include_intercept
+    intercept_pooling : {'unshared', 'shared'}, required if include_intercept
         How to share intercepts across batches.
-        - 'none': Separate intercepts per batch/location
+        - 'unshared': Separate intercepts per batch/location
         - 'shared': Single set of intercepts shared across all batches
         Required when include_intercept is True, must be None otherwise.
 
@@ -267,8 +294,8 @@ class SARIX():
                  D=0,
                  season_period=1,
                  transform='none',
-                 theta_pooling='none',
-                 sigma_pooling='none',
+                 theta_pooling='unshared',
+                 sigma_pooling='unshared',
                  forecast_horizon=1,
                  num_warmup=1000, num_samples=1000, num_chains=1,
                  day_of_year=None,
@@ -280,6 +307,13 @@ class SARIX():
                  include_intercept=False,
                  intercept_pooling=None,
                  intercept_sd_prior_scale=1.0):
+        theta_pooling = _validate_pooling(theta_pooling, 'theta_pooling')
+        sigma_pooling = _validate_pooling(sigma_pooling, 'sigma_pooling')
+        if fourier_pooling is not None:
+            fourier_pooling = _validate_pooling(fourier_pooling, 'fourier_pooling')
+        if intercept_pooling is not None:
+            intercept_pooling = _validate_pooling(intercept_pooling, 'intercept_pooling')
+
         self.n_x = xy.shape[-1] - 1
         self.xy = xy.copy()
         self.p = p
@@ -314,41 +348,37 @@ class SARIX():
             raise ValueError("fourier_pooling must be specified when fourier_K > 0")
         if fourier_K == 0 and fourier_pooling is not None:
             raise ValueError("fourier_pooling should not be specified when fourier_K=0")
-        if fourier_pooling is not None and fourier_pooling not in ['none', 'shared']:
-            raise ValueError("fourier_pooling must be 'none' or 'shared'")
 
         # Validate intercept parameters
         if include_intercept and intercept_pooling is None:
             raise ValueError("intercept_pooling must be specified when include_intercept is True")
         if not include_intercept and intercept_pooling is not None:
             raise ValueError("intercept_pooling should not be specified when include_intercept is False")
-        if intercept_pooling is not None and intercept_pooling not in ['none', 'shared']:
-            raise ValueError("intercept_pooling must be 'none' or 'shared'")
 
         # set up batch shapes for parameter pooling
         # xy has shape batch_shape + (T, n_x + 1)
         batch_shape = xy.shape[:-2]
 
-        if theta_pooling == 'none':
+        if theta_pooling == 'unshared':
             # separate parameters per batch
             self.theta_batch_shape = batch_shape
         elif theta_pooling == 'shared':
             # no batches for theta; will broadcast to share across all batches
             self.theta_batch_shape = ()
         else:
-            raise ValueError("theta_pooling must be 'none' or 'shared'")
+            raise ValueError("theta_pooling must be 'unshared' or 'shared'")
 
-        if sigma_pooling == 'none':
+        if sigma_pooling == 'unshared':
             # separate parameters per batch
             self.sigma_batch_shape = batch_shape
         elif sigma_pooling == 'shared':
             # no batches for sigma; will broadcast to share across all batches
             self.sigma_batch_shape = ()
         else:
-            raise ValueError("sigma_pooling must be 'none' or 'shared'")
+            raise ValueError("sigma_pooling must be 'unshared' or 'shared'")
 
         if fourier_K > 0:
-            if fourier_pooling == 'none':
+            if fourier_pooling == 'unshared':
                 # separate parameters per batch
                 self.fourier_batch_shape = batch_shape
             elif fourier_pooling == 'shared':
