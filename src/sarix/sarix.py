@@ -149,7 +149,9 @@ class SARIX():
         and all other features are exogenous variables (x).
 
     p : int, default=1
-        Order of autoregressive terms (number of lags).
+        Order of autoregressive terms (number of lags). If p=0 and P=0, the
+        model has no autoregressive terms, and the predictive mean comes only
+        from the intercept and/or Fourier terms (if enabled).
 
     d : int, default=0
         Order of differencing (non-seasonal).
@@ -211,6 +213,21 @@ class SARIX():
         - 'shared': Single set of coefficients shared across all batches
         Required when fourier_K > 0, must be None when fourier_K=0.
 
+    include_intercept : bool, default=False
+        Whether to include an intercept term for each variable. The intercept
+        is applied on the modeled scale, i.e. after transformation and
+        differencing: with d=0 it is a level, and with d=1 it is a drift.
+
+    intercept_pooling : {'none', 'shared'}, required if include_intercept
+        How to share intercepts across batches.
+        - 'none': Separate intercepts per batch/location
+        - 'shared': Single set of intercepts shared across all batches
+        Required when include_intercept is True, must be None otherwise.
+
+    intercept_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the standard deviation of the
+        intercepts.
+
     Notes
     -----
     **Fourier Seasonality:**
@@ -259,7 +276,10 @@ class SARIX():
                  fourier_pooling=None,
                  sigma_prior_scale=1.0,
                  theta_sd_prior_scale=1.0,
-                 fourier_beta_sd_prior_scale=1.0):
+                 fourier_beta_sd_prior_scale=1.0,
+                 include_intercept=False,
+                 intercept_pooling=None,
+                 intercept_sd_prior_scale=1.0):
         self.n_x = xy.shape[-1] - 1
         self.xy = xy.copy()
         self.p = p
@@ -281,6 +301,9 @@ class SARIX():
         self.sigma_prior_scale = sigma_prior_scale
         self.theta_sd_prior_scale = theta_sd_prior_scale
         self.fourier_beta_sd_prior_scale = fourier_beta_sd_prior_scale
+        self.include_intercept = include_intercept
+        self.intercept_pooling = intercept_pooling
+        self.intercept_sd_prior_scale = intercept_sd_prior_scale
 
         # Validate Fourier parameters
         if fourier_K > 0 and day_of_year is None:
@@ -293,6 +316,14 @@ class SARIX():
             raise ValueError("fourier_pooling should not be specified when fourier_K=0")
         if fourier_pooling is not None and fourier_pooling not in ['none', 'shared']:
             raise ValueError("fourier_pooling must be 'none' or 'shared'")
+
+        # Validate intercept parameters
+        if include_intercept and intercept_pooling is None:
+            raise ValueError("intercept_pooling must be specified when include_intercept is True")
+        if not include_intercept and intercept_pooling is not None:
+            raise ValueError("intercept_pooling should not be specified when include_intercept is False")
+        if intercept_pooling is not None and intercept_pooling not in ['none', 'shared']:
+            raise ValueError("intercept_pooling must be 'none' or 'shared'")
 
         # set up batch shapes for parameter pooling
         # xy has shape batch_shape + (T, n_x + 1)
@@ -327,6 +358,14 @@ class SARIX():
             # Not using Fourier terms, but set for consistency
             self.fourier_batch_shape = batch_shape
 
+        if intercept_pooling == 'shared':
+            # no batches for intercept; will broadcast to share across all batches
+            self.intercept_batch_shape = ()
+        else:
+            # separate parameters per batch (also set for consistency when
+            # not using an intercept)
+            self.intercept_batch_shape = batch_shape
+
         # do transformation
         self.xy_orig = xy.copy()
         if transform == "sqrt":
@@ -360,9 +399,13 @@ class SARIX():
             n_diff = self.d + self.D * self.season_period
             self.fourier_features = self.fourier_features[n_diff:, :]
 
-        # pre-calculate state update matrix
-        self.update_X = self.state_update_X(self.xy[..., :self.max_lag, :],
-                                            self.xy[..., self.max_lag:, :])
+        # pre-calculate state update matrix; there is none when the model has
+        # no autoregressive terms (p=0 and P=0)
+        if self.max_lag > 0:
+            self.update_X = self.state_update_X(self.xy[..., :self.max_lag, :],
+                                                self.xy[..., self.max_lag:, :])
+        else:
+            self.update_X = None
 
         # do inference
         rng_key, rng_key_predict = random.split(random.PRNGKey(0))
@@ -531,24 +574,47 @@ class SARIX():
         if len(xy.shape) > 2:
             Sigma_chol = jnp.expand_dims(Sigma_chol, -3)
 
-        # state transition matrix parameters
-        n_theta = (2 * self.n_x + 1) * (self.p + self.P * (self.p + 1))
-        theta_sd = numpyro.sample(
-            "theta_sd",
-            dist.HalfCauchy(self.theta_sd_prior_scale * jnp.ones(1))
-        )
-        theta = numpyro.sample(
-            "theta",
-            dist.Normal(loc=jnp.zeros(self.theta_batch_shape + (n_theta,)),
-                        scale=jnp.full(self.theta_batch_shape + (n_theta,),
-                                       theta_sd))
-        )
+        if self.max_lag > 0:
+            # state transition matrix parameters
+            n_theta = (2 * self.n_x + 1) * (self.p + self.P * (self.p + 1))
+            theta_sd = numpyro.sample(
+                "theta_sd",
+                dist.HalfCauchy(self.theta_sd_prior_scale * jnp.ones(1))
+            )
+            theta = numpyro.sample(
+                "theta",
+                dist.Normal(loc=jnp.zeros(self.theta_batch_shape + (n_theta,)),
+                            scale=jnp.full(self.theta_batch_shape + (n_theta,),
+                                           theta_sd))
+            )
 
-        # assemble state transition matrix A
-        A = self.make_state_transition_matrix(theta)
+            # assemble state transition matrix A
+            A = self.make_state_transition_matrix(theta)
 
-        # predictive means based on AR structure
-        step_means_ar = jnp.matmul(self.update_X, A)
+            # predictive means based on AR structure
+            step_means = jnp.matmul(self.update_X, A)
+        else:
+            # no autoregressive terms (p=0 and P=0); the predictive mean comes
+            # only from the intercept and Fourier terms below, if present
+            step_means = 0.0
+
+        # Add intercepts if present
+        if self.include_intercept:
+            intercept_sd = numpyro.sample(
+                "intercept_sd",
+                dist.HalfCauchy(self.intercept_sd_prior_scale * jnp.ones(1))
+            )
+            # Shape: (intercept_batch_shape, n_x+1)
+            intercept = numpyro.sample(
+                "intercept",
+                dist.Normal(
+                    loc=jnp.zeros(self.intercept_batch_shape + (self.n_x+1,)),
+                    scale=intercept_sd
+                )
+            )
+
+            # Insert a time dimension so the intercept broadcasts over time
+            step_means = step_means + jnp.expand_dims(intercept, -2)
 
         # Add Fourier seasonal terms if present
         if self.fourier_K > 0:
@@ -574,10 +640,8 @@ class SARIX():
             # einsum: (batch, n_x+1, 2K) x (T-max_lag, 2K) -> (batch, T-max_lag, n_x+1)
             step_means_fourier = jnp.einsum('...ik,tk->...ti', fourier_beta, F)
 
-            # Total predictive mean = AR terms + Fourier terms
-            step_means = step_means_ar + step_means_fourier
-        else:
-            step_means = step_means_ar
+            # Total predictive mean = AR terms + intercept + Fourier terms
+            step_means = step_means + step_means_fourier
 
         # step innovations are (state - step_means),
         # with shape (batch_shape, T - self.max_lag, n_x + 1)
@@ -598,19 +662,24 @@ class SARIX():
         parameter values from the posterior distribution.
         '''
         # load in parameter estimates and update to target batch size
-        theta = self.samples['theta']
         sigma = self.samples['sigma']
         xy_batch_shape = self.xy.shape[:-2]
-        theta_batch_shape = theta.shape[:-1]
         sigma_batch_shape = sigma.shape[:-1]
 
-        if self.theta_pooling == 'shared':
-            # goal is shape theta_batch_shape + xy_batch_shape + theta.shape[-1]
-            # first insert 1's corresponding to xy_batch_shape, then broadcast
-            ones = (1,) * len(xy_batch_shape)
-            theta = theta.reshape(theta_batch_shape + ones + (theta.shape[-1],))
-            target = theta_batch_shape + xy_batch_shape + (theta.shape[-1],)
-            theta = jnp.broadcast_to(theta, target)
+        if self.max_lag > 0:
+            theta = self.samples['theta']
+            theta_batch_shape = theta.shape[:-1]
+
+            if self.theta_pooling == 'shared':
+                # goal is shape theta_batch_shape + xy_batch_shape + theta.shape[-1]
+                # first insert 1's corresponding to xy_batch_shape, then broadcast
+                ones = (1,) * len(xy_batch_shape)
+                theta = theta.reshape(theta_batch_shape + ones + (theta.shape[-1],))
+                target = theta_batch_shape + xy_batch_shape + (theta.shape[-1],)
+                theta = jnp.broadcast_to(theta, target)
+
+            # state transition matrix
+            A = self.make_state_transition_matrix(theta)
 
         if self.sigma_pooling == 'shared':
             # goal is shape sigma_batch_shape + xy_batch_shape + sigma.shape[-1]
@@ -620,13 +689,33 @@ class SARIX():
             target = sigma_batch_shape + xy_batch_shape + (sigma.shape[-1],)
             sigma = jnp.broadcast_to(sigma, target)
 
-        batch_shape = theta.shape[:-1]
-
-        # state transition matrix
-        A = self.make_state_transition_matrix(theta)
+        # batch_shape is (num_samples,) + xy_batch_shape. It is taken from sigma
+        # rather than theta because theta is not sampled when there are no
+        # autoregressive terms (p=0 and P=0), while sigma always is. After the
+        # pooling broadcasts above, both have this same leading shape.
+        batch_shape = sigma.shape[:-1]
 
         # convert sigma to a batch of covariance matrix Cholesky factors
         Sigma_chol = jnp.expand_dims(sigma, -2) * jnp.eye(sigma.shape[-1])
+
+        # Load intercepts if present
+        if self.include_intercept:
+            intercept = self.samples['intercept']
+            # intercept has shape (num_samples, intercept_batch_shape..., n_x+1)
+            intercept_batch_shape = intercept.shape[:-1]
+
+            if self.intercept_pooling == 'shared':
+                # goal is shape intercept_batch_shape + xy_batch_shape + (n_x+1,)
+                # first insert 1's corresponding to xy_batch_shape, then broadcast
+                ones = (1,) * len(xy_batch_shape)
+                intercept = intercept.reshape(intercept_batch_shape + ones + (intercept.shape[-1],))
+                target = intercept_batch_shape + xy_batch_shape + (intercept.shape[-1],)
+                intercept = jnp.broadcast_to(intercept, target)
+
+            # Expand to (..., 1, n_x+1) for addition; same for every horizon
+            intercept_mean = jnp.expand_dims(intercept, -2)
+        else:
+            intercept_mean = 0
 
         # Load Fourier coefficients if present
         if self.fourier_K > 0:
@@ -669,13 +758,17 @@ class SARIX():
 
         # generate step-ahead forecasts iteratively
         y_pred = []
-        recent_lags = jnp.broadcast_to(self.xy[..., -self.max_lag:, :],
-                                       batch_shape + (self.max_lag, self.xy.shape[-1]))
         dummy_values = jnp.zeros(batch_shape + (1, self.xy.shape[-1]))
+        if self.max_lag > 0:
+            recent_lags = jnp.broadcast_to(self.xy[..., -self.max_lag:, :],
+                                           batch_shape + (self.max_lag, self.xy.shape[-1]))
         for h in range(self.forecast_horizon):
-            update_X = self.state_update_X(recent_lags, dummy_values)
             # AR contribution
-            ar_mean = jnp.matmul(update_X, A)
+            if self.max_lag > 0:
+                update_X = self.state_update_X(recent_lags, dummy_values)
+                ar_mean = jnp.matmul(update_X, A)
+            else:
+                ar_mean = dummy_values
 
             # Add Fourier contribution if present
             if self.fourier_K > 0:
@@ -687,10 +780,11 @@ class SARIX():
             else:
                 fourier_mean = 0
 
-            new_y_pred = ar_mean + fourier_mean + jnp.expand_dims(innovations[h, ...], -2)
+            new_y_pred = ar_mean + intercept_mean + fourier_mean + jnp.expand_dims(innovations[h, ...], -2)
             y_pred.append(new_y_pred)
-            recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred],
-                                          axis=-2)
+            if self.max_lag > 0:
+                recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred],
+                                              axis=-2)
 
         y_pred = jnp.concatenate(y_pred, axis=-2)
         return onp.asarray(y_pred)
