@@ -664,29 +664,29 @@ class SARIX():
         # load in parameter estimates and update to target batch size
         sigma = self.samples['sigma']
         xy_batch_shape = self.xy.shape[:-2]
-        sigma_batch_shape = sigma.shape[:-1]
+        sigma_sample_batch_shape = sigma.shape[:-1]
 
         if self.max_lag > 0:
             theta = self.samples['theta']
-            theta_batch_shape = theta.shape[:-1]
+            theta_sample_batch_shape = theta.shape[:-1]
 
             if self.theta_pooling == 'shared':
-                # goal is shape theta_batch_shape + xy_batch_shape + theta.shape[-1]
+                # goal is shape theta_sample_batch_shape + xy_batch_shape + theta.shape[-1]
                 # first insert 1's corresponding to xy_batch_shape, then broadcast
                 ones = (1,) * len(xy_batch_shape)
-                theta = theta.reshape(theta_batch_shape + ones + (theta.shape[-1],))
-                target = theta_batch_shape + xy_batch_shape + (theta.shape[-1],)
+                theta = theta.reshape(theta_sample_batch_shape + ones + (theta.shape[-1],))
+                target = theta_sample_batch_shape + xy_batch_shape + (theta.shape[-1],)
                 theta = jnp.broadcast_to(theta, target)
 
             # state transition matrix
             A = self.make_state_transition_matrix(theta)
 
         if self.sigma_pooling == 'shared':
-            # goal is shape sigma_batch_shape + xy_batch_shape + sigma.shape[-1]
+            # goal is shape sigma_sample_batch_shape + xy_batch_shape + sigma.shape[-1]
             # first insert 1's corresponding to xy_batch_shape, then broadcast
             ones = (1,) * len(xy_batch_shape)
-            sigma = sigma.reshape(sigma_batch_shape + ones + (sigma.shape[-1],))
-            target = sigma_batch_shape + xy_batch_shape + (sigma.shape[-1],)
+            sigma = sigma.reshape(sigma_sample_batch_shape + ones + (sigma.shape[-1],))
+            target = sigma_sample_batch_shape + xy_batch_shape + (sigma.shape[-1],)
             sigma = jnp.broadcast_to(sigma, target)
 
         # batch_shape is (num_samples,) + xy_batch_shape. It is taken from sigma
@@ -701,15 +701,15 @@ class SARIX():
         # Load intercepts if present
         if self.include_intercept:
             intercept = self.samples['intercept']
-            # intercept has shape (num_samples, intercept_batch_shape..., n_x+1)
-            intercept_batch_shape = intercept.shape[:-1]
+            # intercept has shape (num_samples,) + self.intercept_batch_shape + (n_x+1,)
+            intercept_sample_batch_shape = intercept.shape[:-1]
 
             if self.intercept_pooling == 'shared':
-                # goal is shape intercept_batch_shape + xy_batch_shape + (n_x+1,)
+                # goal is shape intercept_sample_batch_shape + xy_batch_shape + (n_x+1,)
                 # first insert 1's corresponding to xy_batch_shape, then broadcast
                 ones = (1,) * len(xy_batch_shape)
-                intercept = intercept.reshape(intercept_batch_shape + ones + (intercept.shape[-1],))
-                target = intercept_batch_shape + xy_batch_shape + (intercept.shape[-1],)
+                intercept = intercept.reshape(intercept_sample_batch_shape + ones + (intercept.shape[-1],))
+                target = intercept_sample_batch_shape + xy_batch_shape + (intercept.shape[-1],)
                 intercept = jnp.broadcast_to(intercept, target)
 
             # Expand to (..., 1, n_x+1) for addition; same for every horizon
@@ -720,16 +720,16 @@ class SARIX():
         # Load Fourier coefficients if present
         if self.fourier_K > 0:
             fourier_beta = self.samples['fourier_beta']
-            # fourier_beta has shape (num_samples, fourier_batch_shape..., n_x+1, 2*K)
+            # fourier_beta has shape (num_samples,) + self.fourier_batch_shape + (n_x+1, 2*K)
             # Need to match batch_shape
-            fourier_batch_shape = fourier_beta.shape[:-2]
+            fourier_sample_batch_shape = fourier_beta.shape[:-2]
 
             if self.fourier_pooling == 'shared':
-                # goal is shape fourier_batch_shape + xy_batch_shape + (n_x+1, 2*K)
+                # goal is shape fourier_sample_batch_shape + xy_batch_shape + (n_x+1, 2*K)
                 # first insert 1's corresponding to xy_batch_shape, then broadcast
                 ones = (1,) * len(xy_batch_shape)
-                fourier_beta = fourier_beta.reshape(fourier_batch_shape + ones + fourier_beta.shape[-2:])
-                target = fourier_batch_shape + xy_batch_shape + fourier_beta.shape[-2:]
+                fourier_beta = fourier_beta.reshape(fourier_sample_batch_shape + ones + fourier_beta.shape[-2:])
+                target = fourier_sample_batch_shape + xy_batch_shape + fourier_beta.shape[-2:]
                 fourier_beta = jnp.broadcast_to(fourier_beta, target)
 
             # Generate forecast day-of-year values
