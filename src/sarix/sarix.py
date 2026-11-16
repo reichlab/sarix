@@ -5,6 +5,7 @@ Local Trend
 
 import os
 import time
+import warnings
 
 from functools import reduce
 
@@ -134,6 +135,30 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
 
 
 
+POOLING_OPTIONS = ('unshared', 'shared')
+
+
+def _validate_pooling(value, name):
+    """
+    Validate a pooling option and return it as a plain string.
+
+    The deprecated value 'none' is accepted as an alias for 'unshared' with a
+    FutureWarning.
+    """
+    if value == 'none':
+        warnings.warn(
+            f"{name}='none' is deprecated and will be removed in a future "
+            f"release; use {name}='unshared' instead.",
+            FutureWarning,
+            stacklevel=3,
+        )
+        return 'unshared'
+    if value not in POOLING_OPTIONS:
+        raise ValueError(f"{name} must be 'unshared' or 'shared'")
+    # return the canonical plain string (value may be a str enum member)
+    return POOLING_OPTIONS[POOLING_OPTIONS.index(value)]
+
+
 class SARIX():
     """
     Seasonal AutoRegressive Integrated model with eXogenous variables (SARIX).
@@ -143,10 +168,20 @@ class SARIX():
 
     Parameters
     ----------
+    All parameters after `xy` are keyword-only.
+
+    **Data**
+
     xy : array_like
         Input data with shape (batch, time, features) or (time, features).
         The last feature dimension is treated as the target variable (y),
         and all other features are exogenous variables (x).
+
+    day_of_year : array_like, optional
+        Day-of-year values (0-365) for each time point. Required if fourier_K > 0.
+        Used to calculate Fourier seasonal features.
+
+    **Model structure**
 
     p : int, default=1
         Order of autoregressive terms (number of lags). If p=0 and P=0, the
@@ -173,15 +208,64 @@ class SARIX():
         - 'fourthrt': Fourth root transformation
         - 'log': Natural log transformation
 
-    theta_pooling : {'none', 'shared'}, default='none'
+    fourier_K : int, default=0
+        Number of Fourier harmonic pairs to include for seasonal patterns.
+        If 0, no Fourier terms are included. Each harmonic pair includes
+        a sine and cosine term, so fourier_K=3 adds 6 features total.
+
+        Design note: Fourier terms are applied to the data BEFORE differencing
+        to capture seasonal patterns in levels rather than changes.
+
+    include_intercept : bool, default=False
+        Whether to include an intercept term for each variable. The intercept
+        is applied on the modeled scale, i.e. after transformation and
+        differencing: with d=0 it is a level, and with d=1 it is a drift.
+
+    **Pooling**
+
+    For all pooling arguments, the deprecated value 'none' is accepted as an
+    alias for 'unshared' and emits a FutureWarning.
+
+    theta_pooling : {'unshared', 'shared'}, default='unshared'
         How to share AR coefficients across batches.
-        - 'none': Separate parameters per batch/location
+        - 'unshared': Separate parameters per batch/location
         - 'shared': Single set of parameters shared across all batches
 
-    sigma_pooling : {'none', 'shared'}, default='none'
+    sigma_pooling : {'unshared', 'shared'}, default='unshared'
         How to share innovation standard deviations across batches.
-        - 'none': Separate parameters per batch/location
+        - 'unshared': Separate parameters per batch/location
         - 'shared': Single set of parameters shared across all batches
+
+    fourier_pooling : {'unshared', 'shared'}, required if fourier_K > 0
+        How to share Fourier regression coefficients across batches.
+        - 'unshared': Separate coefficients per batch/location
+        - 'shared': Single set of coefficients shared across all batches
+        Required when fourier_K > 0, must be None when fourier_K=0.
+
+    intercept_pooling : {'unshared', 'shared'}, required if include_intercept
+        How to share intercepts across batches.
+        - 'unshared': Separate intercepts per batch/location
+        - 'shared': Single set of intercepts shared across all batches
+        Required when include_intercept is True, must be None otherwise.
+
+    **Prior scales**
+
+    sigma_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the innovation standard deviations.
+
+    theta_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the standard deviation of the AR
+        coefficients.
+
+    fourier_beta_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the standard deviation of the
+        Fourier coefficients.
+
+    intercept_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the standard deviation of the
+        intercepts.
+
+    **Forecasting and MCMC**
 
     forecast_horizon : int, default=1
         Number of time steps to forecast into the future.
@@ -194,39 +278,6 @@ class SARIX():
 
     num_chains : int, default=1
         Number of MCMC chains to run.
-
-    day_of_year : array_like, optional
-        Day-of-year values (0-365) for each time point. Required if fourier_K > 0.
-        Used to calculate Fourier seasonal features.
-
-    fourier_K : int, default=0
-        Number of Fourier harmonic pairs to include for seasonal patterns.
-        If 0, no Fourier terms are included. Each harmonic pair includes
-        a sine and cosine term, so fourier_K=3 adds 6 features total.
-
-        Design note: Fourier terms are applied to the data BEFORE differencing
-        to capture seasonal patterns in levels rather than changes.
-
-    fourier_pooling : {'none', 'shared'}, required if fourier_K > 0
-        How to share Fourier regression coefficients across batches.
-        - 'none': Separate coefficients per batch/location
-        - 'shared': Single set of coefficients shared across all batches
-        Required when fourier_K > 0, must be None when fourier_K=0.
-
-    include_intercept : bool, default=False
-        Whether to include an intercept term for each variable. The intercept
-        is applied on the modeled scale, i.e. after transformation and
-        differencing: with d=0 it is a level, and with d=1 it is a drift.
-
-    intercept_pooling : {'none', 'shared'}, required if include_intercept
-        How to share intercepts across batches.
-        - 'none': Separate intercepts per batch/location
-        - 'shared': Single set of intercepts shared across all batches
-        Required when include_intercept is True, must be None otherwise.
-
-    intercept_sd_prior_scale : float, default=1.0
-        Scale of the HalfCauchy prior on the standard deviation of the
-        intercepts.
 
     Notes
     -----
@@ -261,25 +312,40 @@ class SARIX():
     """
     def __init__(self,
                  xy,
+                 *,
+                 # data
+                 day_of_year=None,
+                 # model structure
                  p=1,
                  d=0,
                  P=0,
                  D=0,
                  season_period=1,
                  transform='none',
-                 theta_pooling='none',
-                 sigma_pooling='none',
-                 forecast_horizon=1,
-                 num_warmup=1000, num_samples=1000, num_chains=1,
-                 day_of_year=None,
                  fourier_K=0,
+                 include_intercept=False,
+                 # pooling
+                 theta_pooling='unshared',
+                 sigma_pooling='unshared',
                  fourier_pooling=None,
+                 intercept_pooling=None,
+                 # prior scales
                  sigma_prior_scale=1.0,
                  theta_sd_prior_scale=1.0,
                  fourier_beta_sd_prior_scale=1.0,
-                 include_intercept=False,
-                 intercept_pooling=None,
-                 intercept_sd_prior_scale=1.0):
+                 intercept_sd_prior_scale=1.0,
+                 # forecasting and MCMC
+                 forecast_horizon=1,
+                 num_warmup=1000,
+                 num_samples=1000,
+                 num_chains=1):
+        theta_pooling = _validate_pooling(theta_pooling, 'theta_pooling')
+        sigma_pooling = _validate_pooling(sigma_pooling, 'sigma_pooling')
+        if fourier_pooling is not None:
+            fourier_pooling = _validate_pooling(fourier_pooling, 'fourier_pooling')
+        if intercept_pooling is not None:
+            intercept_pooling = _validate_pooling(intercept_pooling, 'intercept_pooling')
+
         self.n_x = xy.shape[-1] - 1
         self.xy = xy.copy()
         self.p = p
@@ -314,41 +380,37 @@ class SARIX():
             raise ValueError("fourier_pooling must be specified when fourier_K > 0")
         if fourier_K == 0 and fourier_pooling is not None:
             raise ValueError("fourier_pooling should not be specified when fourier_K=0")
-        if fourier_pooling is not None and fourier_pooling not in ['none', 'shared']:
-            raise ValueError("fourier_pooling must be 'none' or 'shared'")
 
         # Validate intercept parameters
         if include_intercept and intercept_pooling is None:
             raise ValueError("intercept_pooling must be specified when include_intercept is True")
         if not include_intercept and intercept_pooling is not None:
             raise ValueError("intercept_pooling should not be specified when include_intercept is False")
-        if intercept_pooling is not None and intercept_pooling not in ['none', 'shared']:
-            raise ValueError("intercept_pooling must be 'none' or 'shared'")
 
         # set up batch shapes for parameter pooling
         # xy has shape batch_shape + (T, n_x + 1)
         batch_shape = xy.shape[:-2]
 
-        if theta_pooling == 'none':
+        if theta_pooling == 'unshared':
             # separate parameters per batch
             self.theta_batch_shape = batch_shape
         elif theta_pooling == 'shared':
             # no batches for theta; will broadcast to share across all batches
             self.theta_batch_shape = ()
         else:
-            raise ValueError("theta_pooling must be 'none' or 'shared'")
+            raise ValueError("theta_pooling must be 'unshared' or 'shared'")
 
-        if sigma_pooling == 'none':
+        if sigma_pooling == 'unshared':
             # separate parameters per batch
             self.sigma_batch_shape = batch_shape
         elif sigma_pooling == 'shared':
             # no batches for sigma; will broadcast to share across all batches
             self.sigma_batch_shape = ()
         else:
-            raise ValueError("sigma_pooling must be 'none' or 'shared'")
+            raise ValueError("sigma_pooling must be 'unshared' or 'shared'")
 
         if fourier_K > 0:
-            if fourier_pooling == 'none':
+            if fourier_pooling == 'unshared':
                 # separate parameters per batch
                 self.fourier_batch_shape = batch_shape
             elif fourier_pooling == 'shared':
@@ -664,29 +726,29 @@ class SARIX():
         # load in parameter estimates and update to target batch size
         sigma = self.samples['sigma']
         xy_batch_shape = self.xy.shape[:-2]
-        sigma_batch_shape = sigma.shape[:-1]
+        sigma_sample_batch_shape = sigma.shape[:-1]
 
         if self.max_lag > 0:
             theta = self.samples['theta']
-            theta_batch_shape = theta.shape[:-1]
+            theta_sample_batch_shape = theta.shape[:-1]
 
             if self.theta_pooling == 'shared':
-                # goal is shape theta_batch_shape + xy_batch_shape + theta.shape[-1]
+                # goal is shape theta_sample_batch_shape + xy_batch_shape + theta.shape[-1]
                 # first insert 1's corresponding to xy_batch_shape, then broadcast
                 ones = (1,) * len(xy_batch_shape)
-                theta = theta.reshape(theta_batch_shape + ones + (theta.shape[-1],))
-                target = theta_batch_shape + xy_batch_shape + (theta.shape[-1],)
+                theta = theta.reshape(theta_sample_batch_shape + ones + (theta.shape[-1],))
+                target = theta_sample_batch_shape + xy_batch_shape + (theta.shape[-1],)
                 theta = jnp.broadcast_to(theta, target)
 
             # state transition matrix
             A = self.make_state_transition_matrix(theta)
 
         if self.sigma_pooling == 'shared':
-            # goal is shape sigma_batch_shape + xy_batch_shape + sigma.shape[-1]
+            # goal is shape sigma_sample_batch_shape + xy_batch_shape + sigma.shape[-1]
             # first insert 1's corresponding to xy_batch_shape, then broadcast
             ones = (1,) * len(xy_batch_shape)
-            sigma = sigma.reshape(sigma_batch_shape + ones + (sigma.shape[-1],))
-            target = sigma_batch_shape + xy_batch_shape + (sigma.shape[-1],)
+            sigma = sigma.reshape(sigma_sample_batch_shape + ones + (sigma.shape[-1],))
+            target = sigma_sample_batch_shape + xy_batch_shape + (sigma.shape[-1],)
             sigma = jnp.broadcast_to(sigma, target)
 
         # batch_shape is (num_samples,) + xy_batch_shape. It is taken from sigma
@@ -701,15 +763,15 @@ class SARIX():
         # Load intercepts if present
         if self.include_intercept:
             intercept = self.samples['intercept']
-            # intercept has shape (num_samples, intercept_batch_shape..., n_x+1)
-            intercept_batch_shape = intercept.shape[:-1]
+            # intercept has shape (num_samples,) + self.intercept_batch_shape + (n_x+1,)
+            intercept_sample_batch_shape = intercept.shape[:-1]
 
             if self.intercept_pooling == 'shared':
-                # goal is shape intercept_batch_shape + xy_batch_shape + (n_x+1,)
+                # goal is shape intercept_sample_batch_shape + xy_batch_shape + (n_x+1,)
                 # first insert 1's corresponding to xy_batch_shape, then broadcast
                 ones = (1,) * len(xy_batch_shape)
-                intercept = intercept.reshape(intercept_batch_shape + ones + (intercept.shape[-1],))
-                target = intercept_batch_shape + xy_batch_shape + (intercept.shape[-1],)
+                intercept = intercept.reshape(intercept_sample_batch_shape + ones + (intercept.shape[-1],))
+                target = intercept_sample_batch_shape + xy_batch_shape + (intercept.shape[-1],)
                 intercept = jnp.broadcast_to(intercept, target)
 
             # Expand to (..., 1, n_x+1) for addition; same for every horizon
@@ -720,16 +782,16 @@ class SARIX():
         # Load Fourier coefficients if present
         if self.fourier_K > 0:
             fourier_beta = self.samples['fourier_beta']
-            # fourier_beta has shape (num_samples, fourier_batch_shape..., n_x+1, 2*K)
+            # fourier_beta has shape (num_samples,) + self.fourier_batch_shape + (n_x+1, 2*K)
             # Need to match batch_shape
-            fourier_batch_shape = fourier_beta.shape[:-2]
+            fourier_sample_batch_shape = fourier_beta.shape[:-2]
 
             if self.fourier_pooling == 'shared':
-                # goal is shape fourier_batch_shape + xy_batch_shape + (n_x+1, 2*K)
+                # goal is shape fourier_sample_batch_shape + xy_batch_shape + (n_x+1, 2*K)
                 # first insert 1's corresponding to xy_batch_shape, then broadcast
                 ones = (1,) * len(xy_batch_shape)
-                fourier_beta = fourier_beta.reshape(fourier_batch_shape + ones + fourier_beta.shape[-2:])
-                target = fourier_batch_shape + xy_batch_shape + fourier_beta.shape[-2:]
+                fourier_beta = fourier_beta.reshape(fourier_sample_batch_shape + ones + fourier_beta.shape[-2:])
+                target = fourier_sample_batch_shape + xy_batch_shape + fourier_beta.shape[-2:]
                 fourier_beta = jnp.broadcast_to(fourier_beta, target)
 
             # Generate forecast day-of-year values

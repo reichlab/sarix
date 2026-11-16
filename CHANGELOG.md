@@ -11,11 +11,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Models with no autoregressive terms**: SARIX now supports `p=0` and `P=0`, where the predictive mean
   comes only from the intercept and/or Fourier terms. `theta` and `theta_sd` are not sampled in this case.
 - **Optional intercept**: New `include_intercept` parameter adds an intercept for each variable
-  - New `intercept_pooling` parameter (`'none'` or `'shared'`), required when `include_intercept=True`
+  - New `intercept_pooling` parameter (`'unshared'` or `'shared'`), required when `include_intercept=True`
     and must be `None` otherwise
   - New `intercept_sd_prior_scale` parameter for the HalfCauchy prior on the intercept standard deviation
   - The intercept is applied on the modeled scale (after transformation and differencing), so it is a
     level with `d=0` and a drift with `d=1`
+
+### Changed
+- **Breaking**: All `SARIX` constructor arguments after `xy` are now keyword-only, and they are
+  reordered into groups: data (`day_of_year`), model structure, pooling, prior scales, and
+  forecasting/MCMC settings. Code that passes these arguments by name is unaffected; code that
+  passes them by position now raises a `TypeError`.
+
+### Deprecated
+- The `'none'` option for `theta_pooling`, `sigma_pooling`, `fourier_pooling` and `intercept_pooling`
+  is renamed to `'unshared'`, to avoid confusion with Python's `None` (which `fourier_pooling` and
+  `intercept_pooling` use to mean "not applicable"). `'none'` is still accepted for now as an alias for
+  `'unshared'` but emits a `FutureWarning`, and will be removed in a future release. The defaults of
+  `theta_pooling` and `sigma_pooling` are now `'unshared'` (same behavior as before).
 
 ## [0.2.0] - 2025-10-15
 

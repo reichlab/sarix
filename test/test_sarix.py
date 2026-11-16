@@ -1,6 +1,10 @@
 import numpy as np
 import json
 import os
+from enum import Enum
+
+import pytest
+
 from sarix.sarix import SARIX, diff, inv_diff
 
 def test_diff_simple():
@@ -336,17 +340,17 @@ def test_prediction_consistency():
     assert model1.predictions.shape == model2.predictions.shape
 
 
-# Gap #1: Testing with 'none' pooling
+# Gap #1: Testing with 'unshared' pooling
 
-def test_none_pooling_theta():
-    """Test SARIX with 'none' pooling for theta (separate parameters per batch)"""
+def test_unshared_pooling_theta():
+    """Test SARIX with 'unshared' pooling for theta (separate parameters per batch)"""
     np.random.seed(42)
     xy = np.random.randn(3, 20, 2) + 10
 
     model = SARIX(
         xy,
         p=1,
-        theta_pooling='none',  # Separate theta per batch
+        theta_pooling='unshared',  # Separate theta per batch
         sigma_pooling='shared',
         num_warmup=10,
         num_samples=10,
@@ -363,8 +367,8 @@ def test_none_pooling_theta():
     assert model.predictions is not None
 
 
-def test_none_pooling_sigma():
-    """Test SARIX with 'none' pooling for sigma (separate parameters per batch)"""
+def test_unshared_pooling_sigma():
+    """Test SARIX with 'unshared' pooling for sigma (separate parameters per batch)"""
     np.random.seed(42)
     xy = np.random.randn(3, 20, 2) + 10
 
@@ -372,7 +376,7 @@ def test_none_pooling_sigma():
         xy,
         p=1,
         theta_pooling='shared',
-        sigma_pooling='none',  # Separate sigma per batch
+        sigma_pooling='unshared',  # Separate sigma per batch
         num_warmup=10,
         num_samples=10,
         num_chains=1,
@@ -386,16 +390,16 @@ def test_none_pooling_sigma():
     assert model.predictions is not None
 
 
-def test_none_pooling_both():
-    """Test SARIX with 'none' pooling for both theta and sigma"""
+def test_unshared_pooling_both():
+    """Test SARIX with 'unshared' pooling for both theta and sigma"""
     np.random.seed(42)
     xy = np.random.randn(3, 20, 2) + 10
 
     model = SARIX(
         xy,
         p=1,
-        theta_pooling='none',
-        sigma_pooling='none',
+        theta_pooling='unshared',
+        sigma_pooling='unshared',
         num_warmup=10,
         num_samples=10,
         num_chains=1,
@@ -536,7 +540,7 @@ def test_realistic_smaller_dataset():
         D=0,
         transform='log',
         theta_pooling='shared',
-        sigma_pooling='none',  # Separate sigma per location
+        sigma_pooling='unshared',  # Separate sigma per location
         num_warmup=10,
         num_samples=10,
         num_chains=1,
@@ -616,20 +620,20 @@ def test_mcmc_sample_hierarchical_structure():
     model = SARIX(
         xy,
         p=1,
-        theta_pooling='none',  # Separate per batch
-        sigma_pooling='none',
+        theta_pooling='unshared',  # Separate per batch
+        sigma_pooling='unshared',
         num_warmup=10,
         num_samples=num_samples,
         num_chains=1,
         forecast_horizon=1
     )
 
-    # With 'none' pooling, should have theta_sd (global)
+    # With 'unshared' pooling, should have theta_sd (global)
     assert 'theta_sd' in model.samples
     assert 'theta' in model.samples
     assert 'sigma' in model.samples
 
-    # theta should have batch dimension with 'none' pooling
+    # theta should have batch dimension with 'unshared' pooling
     assert model.samples['theta'].shape[0] == num_samples
     assert model.samples['theta'].shape[1] == batch_size
 
@@ -759,8 +763,8 @@ def test_full_pipeline_complex():
         D=1,
         season_period=7,
         transform='sqrt',
-        theta_pooling='none',  # Separate per location
-        sigma_pooling='none',
+        theta_pooling='unshared',  # Separate per location
+        sigma_pooling='unshared',
         num_warmup=10,
         num_samples=10,
         num_chains=1,
@@ -775,7 +779,7 @@ def test_full_pipeline_complex():
     assert model.D == 1
     assert model.max_lag == 2 + 1 * 7  # p + P * season_period
 
-    # Check sample structure with 'none' pooling
+    # Check sample structure with 'unshared' pooling
     assert 'theta' in model.samples
     assert 'theta_sd' in model.samples
     assert 'sigma' in model.samples
@@ -830,7 +834,7 @@ def test_fourier_basic_instantiation():
         p=1,
         day_of_year=day_of_year,
         fourier_K=2,
-        fourier_pooling='none',
+        fourier_pooling='unshared',
         num_warmup=10,
         num_samples=10,
         num_chains=1,
@@ -886,7 +890,7 @@ def test_fourier_sample_structure():
         p=1,
         day_of_year=day_of_year,
         fourier_K=K,
-        fourier_pooling='none',
+        fourier_pooling='unshared',
         num_warmup=10,
         num_samples=num_samples,
         num_chains=1,
@@ -914,7 +918,7 @@ def test_fourier_with_differencing():
         d=1,
         day_of_year=day_of_year,
         fourier_K=2,
-        fourier_pooling='none',
+        fourier_pooling='unshared',
         transform='sqrt',
         num_warmup=10,
         num_samples=10,
@@ -946,7 +950,7 @@ def test_fourier_forecast_extrapolation():
         p=1,
         day_of_year=day_of_year,
         fourier_K=2,
-        fourier_pooling='none',
+        fourier_pooling='unshared',
         num_warmup=10,
         num_samples=10,
         num_chains=1,
@@ -1138,7 +1142,7 @@ def test_cross_platform_fourier_reference():
         d=0,
         day_of_year=day_of_year,
         fourier_K=2,
-        fourier_pooling='none',  # Use 'none' to match original reference data
+        fourier_pooling='unshared',  # Use 'unshared' to match original reference data
         theta_pooling='shared',
         sigma_pooling='shared',
         transform='sqrt',
@@ -1462,11 +1466,11 @@ def test_fourier_pooling_invalid_value():
         )
         assert False, "Should have raised ValueError"
     except ValueError as e:
-        assert "fourier_pooling must be 'none' or 'shared'" in str(e)
+        assert "fourier_pooling must be 'unshared' or 'shared'" in str(e)
 
 
-def test_fourier_pooling_none():
-    """Test Fourier with fourier_pooling='none' (unpooled)"""
+def test_fourier_pooling_unshared():
+    """Test Fourier with fourier_pooling='unshared' (unpooled)"""
     np.random.seed(42)
     batch_size = 3
     n_weeks = 52
@@ -1481,14 +1485,14 @@ def test_fourier_pooling_none():
         p=1,
         day_of_year=day_of_year,
         fourier_K=K,
-        fourier_pooling='none',  # Unpooled
+        fourier_pooling='unshared',  # Unpooled
         num_warmup=10,
         num_samples=num_samples,
         num_chains=1,
         forecast_horizon=2
     )
 
-    # fourier_beta should have batch dimension with 'none' pooling
+    # fourier_beta should have batch dimension with 'unshared' pooling
     # Shape: (num_samples, batch_size, n_x+1, 2*K)
     assert 'fourier_beta' in model.samples
     assert model.samples['fourier_beta'].shape == (num_samples, batch_size, n_features, 2*K)
@@ -1542,13 +1546,13 @@ def test_fourier_pooling_with_multiple_batches():
 
     K = 3
 
-    # Test with 'none' pooling
+    # Test with 'unshared' pooling
     model_none = SARIX(
         xy.copy(),
         p=1,
         day_of_year=day_of_year,
         fourier_K=K,
-        fourier_pooling='none',
+        fourier_pooling='unshared',
         num_warmup=5,
         num_samples=10,
         num_chains=1,
@@ -1704,9 +1708,9 @@ def test_fourier_pooling_mixed_with_theta_sigma():
         p=1,
         day_of_year=day_of_year,
         fourier_K=2,
-        theta_pooling='none',
-        sigma_pooling='none',
-        fourier_pooling='none',
+        theta_pooling='unshared',
+        sigma_pooling='unshared',
+        fourier_pooling='unshared',
         num_warmup=5,
         num_samples=num_samples,
         num_chains=1,
@@ -1725,7 +1729,7 @@ def test_fourier_pooling_mixed_with_theta_sigma():
         day_of_year=day_of_year,
         fourier_K=2,
         theta_pooling='shared',
-        sigma_pooling='none',
+        sigma_pooling='unshared',
         fourier_pooling='shared',
         num_warmup=5,
         num_samples=num_samples,
@@ -1799,7 +1803,7 @@ def test_no_ar_terms_with_fourier():
     day_of_year = np.arange(0, n_weeks * 7, 7) % 365
 
     num_samples = 10
-    for fourier_pooling in ['none', 'shared']:
+    for fourier_pooling in ['unshared', 'shared']:
         model = SARIX(
             xy.copy(),
             p=0,
@@ -1834,7 +1838,7 @@ def test_no_ar_terms_with_differencing_and_fourier():
     day_of_year = np.arange(0, n_weeks * 7, 7) % 365
 
     num_samples = 10
-    for fourier_pooling in ['none', 'shared']:
+    for fourier_pooling in ['unshared', 'shared']:
         model = SARIX(
             xy.copy(),
             p=0,
@@ -1955,11 +1959,11 @@ def test_intercept_pooling_invalid_value():
         )
         assert False, "Should have raised ValueError"
     except ValueError as e:
-        assert "intercept_pooling must be 'none' or 'shared'" in str(e)
+        assert "intercept_pooling must be 'unshared' or 'shared'" in str(e)
 
 
-def test_intercept_pooling_none():
-    """Test intercept with intercept_pooling='none' (unpooled)"""
+def test_intercept_pooling_unshared():
+    """Test intercept with intercept_pooling='unshared' (unpooled)"""
     np.random.seed(42)
     batch_size = 3
     n_features = 2
@@ -1970,14 +1974,14 @@ def test_intercept_pooling_none():
         xy,
         p=1,
         include_intercept=True,
-        intercept_pooling='none',
+        intercept_pooling='unshared',
         num_warmup=5,
         num_samples=num_samples,
         num_chains=1,
         forecast_horizon=2
     )
 
-    # intercept should have batch dimension with 'none' pooling
+    # intercept should have batch dimension with 'unshared' pooling
     # Shape: (num_samples, batch_size, n_x+1)
     assert model.samples['intercept'].shape == (num_samples, batch_size, n_features)
     assert model.samples['intercept_sd'].shape == (num_samples, 1)
@@ -2047,7 +2051,7 @@ def test_no_ar_terms_with_fourier_and_intercept():
         fourier_K=2,
         fourier_pooling='shared',
         include_intercept=True,
-        intercept_pooling='none',
+        intercept_pooling='unshared',
         num_warmup=5,
         num_samples=num_samples,
         num_chains=1,
@@ -2072,7 +2076,7 @@ def test_analytical_intercept_recovers_level():
         xy,
         p=0,
         include_intercept=True,
-        intercept_pooling='none',
+        intercept_pooling='unshared',
         num_warmup=200,
         num_samples=200,
         num_chains=1,
@@ -2086,3 +2090,65 @@ def test_analytical_intercept_recovers_level():
     # Forecasts are centered on the levels too
     pred_median = np.median(model.predictions[:, :, :, 0], axis=0)
     assert np.allclose(pred_median, levels[:, None], atol=0.3)
+
+
+@pytest.mark.parametrize("pooling_arg, extra_kwargs", [
+    ("theta_pooling", {}),
+    ("sigma_pooling", {}),
+    ("fourier_pooling", {"fourier_K": 1, "day_of_year": np.arange(0, 20 * 7, 7) % 365}),
+    ("intercept_pooling", {"include_intercept": True}),
+])
+def test_pooling_none_is_deprecated_alias_for_unshared(pooling_arg, extra_kwargs):
+    """Test that the deprecated 'none' pooling value warns and maps to 'unshared'"""
+    np.random.seed(42)
+    batch_size = 2
+    xy = np.random.randn(batch_size, 20, 2) + 10
+
+    with pytest.warns(FutureWarning, match=f"{pooling_arg}='none' is deprecated"):
+        model = SARIX(
+            xy,
+            p=1,
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1,
+            **{pooling_arg: 'none'},
+            **extra_kwargs
+        )
+
+    assert getattr(model, pooling_arg) == 'unshared'
+    batch_shape_attr = pooling_arg.replace('_pooling', '_batch_shape')
+    assert getattr(model, batch_shape_attr) == (batch_size,)
+
+
+def test_arguments_after_xy_are_keyword_only():
+    """Test that passing model arguments positionally raises a TypeError"""
+    xy = np.random.randn(2, 20, 2) + 10
+
+    with pytest.raises(TypeError, match="positional argument"):
+        SARIX(xy, 1)
+
+
+def test_pooling_accepts_str_enum():
+    """Test that str enum members (as used by idmodels) are accepted and stored as plain strings"""
+
+    class Pooling(str, Enum):
+        UNSHARED = 'unshared'
+        SHARED = 'shared'
+
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    model = SARIX(
+        xy,
+        p=1,
+        theta_pooling=Pooling.SHARED,
+        sigma_pooling=Pooling.UNSHARED,
+        num_warmup=5,
+        num_samples=5,
+        num_chains=1
+    )
+
+    assert type(model.theta_pooling) is str and model.theta_pooling == 'shared'
+    assert type(model.sigma_pooling) is str and model.sigma_pooling == 'unshared'
+    assert model.theta_batch_shape == ()
+    assert model.sigma_batch_shape == (2,)
