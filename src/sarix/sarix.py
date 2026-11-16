@@ -726,11 +726,11 @@ class SARIX():
         # load in parameter estimates and update to target batch size
         sigma = self.samples['sigma']
         xy_batch_shape = self.xy.shape[:-2]
-        sigma_sample_batch_shape = sigma.shape[:-1]
+        sigma_sample_batch_shape = sigma.shape[:-1] # `(num_samples,) + self.sigma_batch_shape`, dropping last dimension which is per variable (self.n_x + 1,)
 
         if self.max_lag > 0:
             theta = self.samples['theta']
-            theta_sample_batch_shape = theta.shape[:-1]
+            theta_sample_batch_shape = theta.shape[:-1] # `(num_samples,) + self.theta_batch_shape`, dropping last dimension which is per coefficient (n_theta,)
 
             if self.theta_pooling == 'shared':
                 # goal is shape theta_sample_batch_shape + xy_batch_shape + theta.shape[-1]
@@ -764,7 +764,7 @@ class SARIX():
         if self.include_intercept:
             intercept = self.samples['intercept']
             # intercept has shape (num_samples,) + self.intercept_batch_shape + (n_x+1,)
-            intercept_sample_batch_shape = intercept.shape[:-1]
+            intercept_sample_batch_shape = intercept.shape[:-1] # `(num_samples,) + self.intercept_batch_shape`, dropping last dimension which is per variable (self.n_x + 1,)
 
             if self.intercept_pooling == 'shared':
                 # goal is shape intercept_sample_batch_shape + xy_batch_shape + (n_x+1,)
@@ -784,7 +784,7 @@ class SARIX():
             fourier_beta = self.samples['fourier_beta']
             # fourier_beta has shape (num_samples,) + self.fourier_batch_shape + (n_x+1, 2*K)
             # Need to match batch_shape
-            fourier_sample_batch_shape = fourier_beta.shape[:-2]
+            fourier_sample_batch_shape = fourier_beta.shape[:-2] # `(num_samples,) + self.fourier_batch_shape`, dropping last dimensions which are per variable and coefficient
 
             if self.fourier_pooling == 'shared':
                 # goal is shape fourier_sample_batch_shape + xy_batch_shape + (n_x+1, 2*K)
