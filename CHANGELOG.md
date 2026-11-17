@@ -11,9 +11,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Models with no autoregressive terms**: SARIX now supports `p=0` and `P=0`, where the predictive mean
   comes only from the intercept and/or Fourier terms. `theta` and `theta_sd` are not sampled in this case.
 - **Optional intercept**: New `include_intercept` parameter adds an intercept for each variable
-  - New `intercept_pooling` parameter (`'unshared'` or `'shared'`), required when `include_intercept=True`
+  - New `intercept_pooling` parameter (`'unshared'`, `'shared'` or `'partial'`), required when `include_intercept=True`
     and must be `None` otherwise
   - New `intercept_sd_prior_scale` parameter for the HalfCauchy prior on the intercept standard deviation
+  - `intercept_pooling='partial'` gives each batch its own intercept with a hierarchical prior
+    `intercept ~ Normal(intercept_mu, intercept_sd)`, where `intercept_mu` is a learned mean per variable
+    with prior `Normal(0, intercept_mu_prior_scale)`. Intercepts are then shrunk toward a shared, possibly
+    non-zero mean rather than toward 0
+  - New `intercept_mu_prior_scale` parameter. By default (`None`) it is set from the data: for each
+    variable, 2.5 times the root mean square of its values on the modeled scale. A scalar or a
+    per-variable array can be passed instead
   - The intercept is applied on the modeled scale (after transformation and differencing), so it is a
     level with `d=0` and a drift with `d=1`
 
