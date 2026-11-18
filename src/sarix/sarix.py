@@ -136,9 +136,16 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
 
 
 POOLING_OPTIONS = ('unshared', 'shared')
+INTERCEPT_POOLING_OPTIONS = POOLING_OPTIONS + ('partial',)
 
 
-def _validate_pooling(value, name):
+def _format_options(options):
+    """Format pooling options for an error message, e.g. "'a', 'b' or 'c'"."""
+    quoted = [f"'{option}'" for option in options]
+    return ", ".join(quoted[:-1]) + " or " + quoted[-1]
+
+
+def _validate_pooling(value, name, options=POOLING_OPTIONS):
     """
     Validate a pooling option and return it as a plain string.
 
@@ -153,10 +160,10 @@ def _validate_pooling(value, name):
             stacklevel=3,
         )
         return 'unshared'
-    if value not in POOLING_OPTIONS:
-        raise ValueError(f"{name} must be 'unshared' or 'shared'")
+    if value not in options:
+        raise ValueError(f"{name} must be {_format_options(options)}")
     # return the canonical plain string (value may be a str enum member)
-    return POOLING_OPTIONS[POOLING_OPTIONS.index(value)]
+    return options[options.index(value)]
 
 
 class SARIX():
@@ -242,10 +249,20 @@ class SARIX():
         - 'shared': Single set of coefficients shared across all batches
         Required when fourier_K > 0, must be None when fourier_K=0.
 
-    intercept_pooling : {'unshared', 'shared'}, required if include_intercept
+    intercept_pooling : {'unshared', 'shared', 'partial'}, required if include_intercept
         How to share intercepts across batches.
-        - 'unshared': Separate intercepts per batch/location
+        - 'unshared': Separate intercepts per batch/location, each with prior
+          Normal(0, intercept_sd), so they are all shrunk toward 0
         - 'shared': Single set of intercepts shared across all batches
+        - 'partial': Separate intercepts per batch/location, each with prior
+          Normal(intercept_mu, intercept_sd), where intercept_mu is a learned
+          mean for each variable. Intercepts are shrunk toward that shared
+          mean rather than toward 0, which suits series whose level on the
+          modeled scale is far from 0. This hierarchical prior can produce
+          some divergent transitions during MCMC, particularly when the
+          batch levels are tightly clustered (so intercept_sd is near 0) and
+          the model has autoregressive terms; check the divergence count
+          reported by MCMC and consider more warmup iterations if it is high.
         Required when include_intercept is True, must be None otherwise.
 
     **Prior scales**
@@ -264,6 +281,18 @@ class SARIX():
     intercept_sd_prior_scale : float, default=1.0
         Scale of the HalfCauchy prior on the standard deviation of the
         intercepts.
+
+    intercept_mu_prior_scale : float or array_like, optional
+        Scale of the Normal(0, intercept_mu_prior_scale) prior on the
+        per-variable intercept means. Only used when
+        intercept_pooling='partial'. May be a scalar or have shape (n_x + 1,)
+        for a separate scale per variable. If None (the default), it is set
+        from the data: for each variable, 2.5 times the root mean square of
+        its values on the modeled scale (after transformation and
+        differencing), across all batches and time points. Because the root
+        mean square grows with the level of the series as well as its spread,
+        this keeps the prior wide relative to the series' level. The resolved
+        value is stored in the `intercept_mu_prior_scale` attribute.
 
     **Forecasting and MCMC**
 
@@ -334,6 +363,7 @@ class SARIX():
                  theta_sd_prior_scale=1.0,
                  fourier_beta_sd_prior_scale=1.0,
                  intercept_sd_prior_scale=1.0,
+                 intercept_mu_prior_scale=None,
                  # forecasting and MCMC
                  forecast_horizon=1,
                  num_warmup=1000,
@@ -344,7 +374,8 @@ class SARIX():
         if fourier_pooling is not None:
             fourier_pooling = _validate_pooling(fourier_pooling, 'fourier_pooling')
         if intercept_pooling is not None:
-            intercept_pooling = _validate_pooling(intercept_pooling, 'intercept_pooling')
+            intercept_pooling = _validate_pooling(intercept_pooling, 'intercept_pooling',
+                                                  INTERCEPT_POOLING_OPTIONS)
 
         self.n_x = xy.shape[-1] - 1
         self.xy = xy.copy()
@@ -370,6 +401,7 @@ class SARIX():
         self.include_intercept = include_intercept
         self.intercept_pooling = intercept_pooling
         self.intercept_sd_prior_scale = intercept_sd_prior_scale
+        self.intercept_mu_prior_scale = intercept_mu_prior_scale
 
         # Validate Fourier parameters
         if fourier_K > 0 and day_of_year is None:
@@ -386,6 +418,14 @@ class SARIX():
             raise ValueError("intercept_pooling must be specified when include_intercept is True")
         if not include_intercept and intercept_pooling is not None:
             raise ValueError("intercept_pooling should not be specified when include_intercept is False")
+        if intercept_mu_prior_scale is not None:
+            intercept_mu_prior_scale = onp.asarray(intercept_mu_prior_scale, dtype=float)
+            if intercept_mu_prior_scale.shape not in ((), (xy.shape[-1],)):
+                raise ValueError(
+                    f"intercept_mu_prior_scale must be a scalar or have shape "
+                    f"(n_x + 1,) = ({xy.shape[-1]},), but got shape "
+                    f"{intercept_mu_prior_scale.shape}")
+            self.intercept_mu_prior_scale = intercept_mu_prior_scale
 
         # set up batch shapes for parameter pooling
         # xy has shape batch_shape + (T, n_x + 1)
@@ -424,8 +464,8 @@ class SARIX():
             # no batches for intercept; will broadcast to share across all batches
             self.intercept_batch_shape = ()
         else:
-            # separate parameters per batch (also set for consistency when
-            # not using an intercept)
+            # separate parameters per batch, for both 'unshared' and 'partial'
+            # (also set for consistency when not using an intercept)
             self.intercept_batch_shape = batch_shape
 
         # do transformation
@@ -454,6 +494,11 @@ class SARIX():
         # inverting differencing
         transformed_xy = self.xy
         self.xy = diff(self.xy, self.d, self.D, self.season_period, pad_na=False)
+
+        # set a data-based scale for the intercept_mu prior if not provided;
+        # this uses the modeled scale, where the intercept is applied
+        if self.intercept_pooling == 'partial' and self.intercept_mu_prior_scale is None:
+            self.intercept_mu_prior_scale = self._default_intercept_mu_prior_scale(self.xy)
 
         # Trim Fourier features to match differenced data length
         # After differencing, we lose d + D*season_period time points
@@ -488,6 +533,28 @@ class SARIX():
             self.predictions = jnp.maximum(0.0, self.predictions)**4
         elif transform == "sqrt":
             self.predictions = jnp.maximum(0.0, self.predictions)**2
+
+
+    @staticmethod
+    def _default_intercept_mu_prior_scale(xy):
+        """
+        Data-based scale for the prior on intercept_mu: for each variable,
+        2.5 times the root mean square of xy (on the modeled scale) across all
+        batches and time points.
+
+        Parameters
+        ----------
+        xy : ndarray
+            Data on the modeled scale, with shape batch_shape + (T, n_x + 1)
+
+        Returns
+        -------
+        ndarray of shape (n_x + 1,). Variables whose values are all zero get a
+        scale of 1.0, since a scale of 0 is not a valid prior.
+        """
+        n_vars = xy.shape[-1]
+        rms = onp.sqrt(onp.nanmean(onp.square(xy.reshape(-1, n_vars)), axis=0))
+        return onp.where(rms > 0, 2.5 * rms, 1.0)
 
 
     def _calculate_fourier_features(self, day_of_year, K):
@@ -666,13 +733,22 @@ class SARIX():
                 "intercept_sd",
                 dist.HalfCauchy(self.intercept_sd_prior_scale * jnp.ones(1))
             )
+            intercept_loc = jnp.zeros(self.intercept_batch_shape + (self.n_x+1,))
+            if self.intercept_pooling == 'partial':
+                # learned mean for each variable, shared across batches;
+                # intercepts are shrunk toward it rather than toward 0
+                intercept_mu = numpyro.sample(
+                    "intercept_mu",
+                    dist.Normal(
+                        loc=jnp.zeros((self.n_x+1,)),
+                        scale=self.intercept_mu_prior_scale
+                    )
+                )
+                intercept_loc = intercept_loc + intercept_mu
             # Shape: (intercept_batch_shape, n_x+1)
             intercept = numpyro.sample(
                 "intercept",
-                dist.Normal(
-                    loc=jnp.zeros(self.intercept_batch_shape + (self.n_x+1,)),
-                    scale=intercept_sd
-                )
+                dist.Normal(loc=intercept_loc, scale=intercept_sd)
             )
 
             # Insert a time dimension so the intercept broadcasts over time
@@ -765,6 +841,12 @@ class SARIX():
             intercept = self.samples['intercept']
             # intercept has shape (num_samples,) + self.intercept_batch_shape + (n_x+1,)
             intercept_sample_batch_shape = intercept.shape[:-1] # `(num_samples,) + self.intercept_batch_shape`, dropping last dimension which is per variable (self.n_x + 1,)
+
+            # With 'unshared' and 'partial' pooling, there is already one
+            # intercept per batch. For 'partial', the learned intercept_mu
+            # enters the forecasts through these per-batch intercepts (it would
+            # only be used directly to forecast a new batch, which predict()
+            # does not do).
 
             if self.intercept_pooling == 'shared':
                 # goal is shape intercept_sample_batch_shape + xy_batch_shape + (n_x+1,)

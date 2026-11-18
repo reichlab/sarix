@@ -1959,7 +1959,7 @@ def test_intercept_pooling_invalid_value():
         )
         assert False, "Should have raised ValueError"
     except ValueError as e:
-        assert "intercept_pooling must be 'unshared' or 'shared'" in str(e)
+        assert "intercept_pooling must be 'unshared', 'shared' or 'partial'" in str(e)
 
 
 def test_intercept_pooling_unshared():
@@ -2014,6 +2014,197 @@ def test_intercept_pooling_shared():
 
     # Predictions should broadcast across batches
     assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
+
+
+def test_intercept_pooling_partial():
+    """Test intercept with intercept_pooling='partial' (hierarchical, learned per-variable mean)"""
+    np.random.seed(42)
+    batch_size = 3
+    n_features = 2
+    xy = np.random.randn(batch_size, 30, n_features) + 10
+
+    num_samples = 10
+    model = SARIX(
+        xy,
+        p=1,
+        include_intercept=True,
+        intercept_pooling='partial',
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    assert model.intercept_batch_shape == (batch_size,)
+    # one intercept per batch and variable, one mean per variable
+    assert model.samples['intercept'].shape == (num_samples, batch_size, n_features)
+    assert model.samples['intercept_mu'].shape == (num_samples, n_features)
+    assert model.samples['intercept_sd'].shape == (num_samples, 1)
+    assert model.predictions.shape == (num_samples, batch_size, 2, n_features)
+    assert np.all(np.isfinite(model.predictions))
+
+
+def test_intercept_mu_prior_scale_default_is_data_based():
+    """Test that the default intercept_mu prior scale is 2.5 times the per-variable
+    root mean square of the data on the modeled scale (after transform and differencing)"""
+    np.random.seed(42)
+    xy = np.random.randn(3, 30, 2) + np.array([10.0, 100.0])
+
+    model = SARIX(
+        xy,
+        p=1,
+        d=1,
+        transform='sqrt',
+        include_intercept=True,
+        intercept_pooling='partial',
+        num_warmup=5,
+        num_samples=5,
+        num_chains=1
+    )
+
+    modeled_xy = diff(np.sqrt(xy), d=1)
+    expected = 2.5 * np.sqrt(np.mean(modeled_xy.reshape(-1, 2) ** 2, axis=0))
+    assert np.allclose(model.intercept_mu_prior_scale, expected)
+
+
+def test_intercept_mu_prior_scale_grows_with_level():
+    """Test that the data-based scale covers a level far from 0 even when the noise is small"""
+    np.random.seed(42)
+    xy = 1000.0 + 0.1 * np.random.randn(2, 20, 1)
+
+    scale = SARIX._default_intercept_mu_prior_scale(xy)
+    assert scale.shape == (1,)
+    assert scale[0] > 1000.0
+
+
+def test_intercept_mu_prior_scale_all_zero_data():
+    """Test that a variable whose values are all zero gets a valid (positive) scale"""
+    xy = np.zeros((2, 20, 2))
+    xy[..., 1] = 3.0
+
+    scale = SARIX._default_intercept_mu_prior_scale(xy)
+    assert np.allclose(scale, [1.0, 7.5])
+
+
+def test_intercept_mu_prior_scale_explicit_value_is_kept():
+    """Test that an explicitly passed intercept_mu_prior_scale overrides the data-based default"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    model = SARIX(
+        xy,
+        p=1,
+        include_intercept=True,
+        intercept_pooling='partial',
+        intercept_mu_prior_scale=50.0,
+        num_warmup=5,
+        num_samples=5,
+        num_chains=1
+    )
+
+    assert model.intercept_mu_prior_scale == 50.0
+
+
+def test_intercept_mu_prior_scale_accepts_list():
+    """Test that a per-variable intercept_mu_prior_scale can be passed as a list"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    num_samples = 5
+    model = SARIX(
+        xy,
+        p=1,
+        include_intercept=True,
+        intercept_pooling='partial',
+        intercept_mu_prior_scale=[5.0, 50.0],
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1
+    )
+
+    assert np.allclose(model.intercept_mu_prior_scale, [5.0, 50.0])
+    assert model.samples['intercept_mu'].shape == (num_samples, 2)
+
+
+@pytest.mark.parametrize("bad_scale", [[5.0, 5.0, 5.0], [[5.0, 5.0]]])
+def test_intercept_mu_prior_scale_wrong_shape_raises(bad_scale):
+    """Test that an intercept_mu_prior_scale not of shape () or (n_x + 1,) is rejected"""
+    xy = np.random.randn(2, 20, 2) + 10
+
+    with pytest.raises(ValueError, match="intercept_mu_prior_scale must be a scalar or have shape"):
+        SARIX(
+            xy,
+            p=1,
+            include_intercept=True,
+            intercept_pooling='partial',
+            intercept_mu_prior_scale=bad_scale,
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1
+        )
+
+
+@pytest.mark.parametrize("intercept_pooling", ['unshared', 'shared'])
+def test_intercept_mu_only_sampled_with_partial_pooling(intercept_pooling):
+    """Test that intercept_mu is not sampled for 'unshared' or 'shared' intercept pooling"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    model = SARIX(
+        xy,
+        p=1,
+        include_intercept=True,
+        intercept_pooling=intercept_pooling,
+        num_warmup=5,
+        num_samples=5,
+        num_chains=1
+    )
+
+    assert 'intercept' in model.samples
+    assert 'intercept_mu' not in model.samples
+
+
+@pytest.mark.parametrize("pooling_arg", ["theta_pooling", "sigma_pooling"])
+def test_partial_pooling_only_valid_for_intercept(pooling_arg):
+    """Test that 'partial' is rejected for pooling arguments other than intercept_pooling"""
+    xy = np.random.randn(2, 20, 2) + 10
+
+    with pytest.raises(ValueError, match=f"{pooling_arg} must be 'unshared' or 'shared'"):
+        SARIX(xy, **{pooling_arg: 'partial'}, num_warmup=5, num_samples=5)
+
+
+def test_analytical_partial_intercept_recovers_nonzero_mean():
+    """Test that with p=0, d=0, partial pooling learns a non-zero shared mean and
+    shrinks intercepts toward it rather than toward 0"""
+    np.random.seed(42)
+    true_mu = 20.0
+    levels = true_mu + np.array([-0.6, -0.3, 0.0, 0.3, 0.6])
+    n_weeks = 52
+    xy = levels[:, None, None] + 0.3 * np.random.randn(len(levels), n_weeks, 1)
+
+    model = SARIX(
+        xy,
+        p=0,
+        include_intercept=True,
+        intercept_pooling='partial',
+        num_warmup=300,
+        num_samples=300,
+        num_chains=1,
+        forecast_horizon=2
+    )
+
+    # The learned mean is close to the center of the levels
+    mu_median = np.median(model.samples['intercept_mu'][:, 0])
+    assert abs(mu_median - true_mu) < 1.0
+
+    # Intercepts recover each location's level
+    intercept_median = np.median(model.samples['intercept'][:, :, 0], axis=0)
+    assert np.allclose(intercept_median, levels, atol=0.3)
+
+    # Because intercepts are centered on intercept_mu rather than 0, their
+    # spread is small (with 'unshared' pooling it would need to be ~20 to
+    # reach the levels from 0)
+    assert np.median(model.samples['intercept_sd']) < 2.0
 
 
 def test_backwards_compatibility_no_intercept():
