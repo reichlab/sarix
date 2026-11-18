@@ -258,7 +258,11 @@ class SARIX():
           Normal(intercept_mu, intercept_sd), where intercept_mu is a learned
           mean for each variable. Intercepts are shrunk toward that shared
           mean rather than toward 0, which suits series whose level on the
-          modeled scale is far from 0.
+          modeled scale is far from 0. This hierarchical prior can produce
+          some divergent transitions during MCMC, particularly when the
+          batch levels are tightly clustered (so intercept_sd is near 0) and
+          the model has autoregressive terms; check the divergence count
+          reported by MCMC and consider more warmup iterations if it is high.
         Required when include_intercept is True, must be None otherwise.
 
     **Prior scales**
@@ -414,6 +418,14 @@ class SARIX():
             raise ValueError("intercept_pooling must be specified when include_intercept is True")
         if not include_intercept and intercept_pooling is not None:
             raise ValueError("intercept_pooling should not be specified when include_intercept is False")
+        if intercept_mu_prior_scale is not None:
+            intercept_mu_prior_scale = onp.asarray(intercept_mu_prior_scale, dtype=float)
+            if intercept_mu_prior_scale.shape not in ((), (xy.shape[-1],)):
+                raise ValueError(
+                    f"intercept_mu_prior_scale must be a scalar or have shape "
+                    f"(n_x + 1,) = ({xy.shape[-1]},), but got shape "
+                    f"{intercept_mu_prior_scale.shape}")
+            self.intercept_mu_prior_scale = intercept_mu_prior_scale
 
         # set up batch shapes for parameter pooling
         # xy has shape batch_shape + (T, n_x + 1)

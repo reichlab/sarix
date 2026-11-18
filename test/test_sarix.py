@@ -2105,6 +2105,45 @@ def test_intercept_mu_prior_scale_explicit_value_is_kept():
     assert model.intercept_mu_prior_scale == 50.0
 
 
+def test_intercept_mu_prior_scale_accepts_list():
+    """Test that a per-variable intercept_mu_prior_scale can be passed as a list"""
+    np.random.seed(42)
+    xy = np.random.randn(2, 20, 2) + 10
+
+    num_samples = 5
+    model = SARIX(
+        xy,
+        p=1,
+        include_intercept=True,
+        intercept_pooling='partial',
+        intercept_mu_prior_scale=[5.0, 50.0],
+        num_warmup=5,
+        num_samples=num_samples,
+        num_chains=1
+    )
+
+    assert np.allclose(model.intercept_mu_prior_scale, [5.0, 50.0])
+    assert model.samples['intercept_mu'].shape == (num_samples, 2)
+
+
+@pytest.mark.parametrize("bad_scale", [[5.0, 5.0, 5.0], [[5.0, 5.0]]])
+def test_intercept_mu_prior_scale_wrong_shape_raises(bad_scale):
+    """Test that an intercept_mu_prior_scale not of shape () or (n_x + 1,) is rejected"""
+    xy = np.random.randn(2, 20, 2) + 10
+
+    with pytest.raises(ValueError, match="intercept_mu_prior_scale must be a scalar or have shape"):
+        SARIX(
+            xy,
+            p=1,
+            include_intercept=True,
+            intercept_pooling='partial',
+            intercept_mu_prior_scale=bad_scale,
+            num_warmup=5,
+            num_samples=5,
+            num_chains=1
+        )
+
+
 @pytest.mark.parametrize("intercept_pooling", ['unshared', 'shared'])
 def test_intercept_mu_only_sampled_with_partial_pooling(intercept_pooling):
     """Test that intercept_mu is not sampled for 'unshared' or 'shared' intercept pooling"""
