@@ -8,6 +8,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Calendar effects**: new `calendar_labels` parameter (integer array over the data and forecast time
+  points, laid out like `xy` with shape `(..., T + forecast_horizon, n_x + 1)` and broadcast over batches
+  and variables; 0 = no effect, 1..K = a multiplicative effect, e.g. holiday weeks). A trailing axis of 1
+  gives every variable effects; 0 in a variable's column gives it none
+  - Each variable with effects is adjusted on its modeled scale before differencing, the likelihood
+    includes the Jacobian of the adjustment, and forecasts at labelled time points are mapped back
+  - Effects are separate for each variable (and each batch with `'unshared'` pooling) and share one
+    standard deviation, like the other coefficients; the indices of the variables with effects are stored
+    in the `calendar_variables` attribute, and `calendar_effect` has shape
+    `(num_samples,) [+ batch_shape] + (len(calendar_variables), K)`
+  - New `calendar_pooling` parameter (`'unshared'`, `'shared'` or `'partial'`), required when
+    `calendar_labels` is given and must be `None` otherwise
+  - `calendar_pooling='partial'` gives each batch its own effects, shrunk toward a learned common effect
+    `calendar_effect_mu` for each variable and label (prior `Normal(0, calendar_effect_mu_prior_scale)`).
+    It uses a non-centred parameterization: `calendar_effect = calendar_effect_mu + calendar_effect_sd *
+    calendar_effect_decentered`, with `calendar_effect_decentered ~ Normal(0, 1)`
+  - New `calendar_effect_mu_prior_scale` parameter (default 1.0; a scalar or one value per variable)
+  - New `calendar_effect_sd_prior_scale` parameter for the HalfCauchy prior on the effects' standard
+    deviation; effects are stored in the samples as `calendar_effect` (and `calendar_effect_sd`)
+  - Warns when an effect has no modeled observations and so is drawn from the prior: a label in 1..K
+    that never occurs for a variable with effects, or one that occurs only in the forecast horizon or the
+    conditioned-on first time points (checked per variable, and per batch with `'unshared'` pooling)
+- **Input scale description**: new `input_power` and `input_center` parameters (only with
+  `transform='none'`) declare that `xy` was power-transformed (power 0 = log) and centred before being
+  passed to SARIX; calendar effects use them to act as multipliers on the original scale. `input_power`
+  is a scalar or one value per variable (shape `(n_x + 1,)`); `input_center` has one value per batch and
+  variable (broadcast to `batch_shape + (n_x + 1,)`), must be finite for variables with calendar effects
+  and a non-zero power, and may be NaN elsewhere
+- **Divergence count**: the number of divergent MCMC transitions is stored in the new `num_divergences` attribute
 - **Models with no autoregressive terms**: SARIX now supports `p=0` and `P=0`, where the predictive mean
   comes only from the intercept and/or Fourier terms. `theta` and `theta_sd` are not sampled in this case.
 - **Optional intercept**: New `include_intercept` parameter adds an intercept for each variable
@@ -29,6 +58,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reordered into groups: data (`day_of_year`), model structure, pooling, prior scales, and
   forecasting/MCMC settings. Code that passes these arguments by name is unaffected; code that
   passes them by position now raises a `TypeError`.
+- An unknown `transform` value now raises a `ValueError` instead of being treated as `'none'`.
 
 ### Deprecated
 - The `'none'` option for `theta_pooling`, `sigma_pooling`, `fourier_pooling` and `intercept_pooling`

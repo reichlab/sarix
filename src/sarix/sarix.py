@@ -137,6 +137,22 @@ def inv_diff(x, dx, d=0, D=0, season_period=7):
 
 POOLING_OPTIONS = ('unshared', 'shared')
 INTERCEPT_POOLING_OPTIONS = POOLING_OPTIONS + ('partial',)
+CALENDAR_POOLING_OPTIONS = POOLING_OPTIONS + ('partial',)
+
+# power of the power transform each `transform` option applies (0 means log)
+TRANSFORM_POWERS = {'none': 1.0, 'sqrt': 0.5, 'fourthrt': 0.25, 'log': 0.0}
+
+
+def _diff_jnp(x, d=0, D=0, season_period=7):
+    """
+    `diff` with pad_na=False, written with array slicing so that it can be
+    applied to traced jax arrays inside the model.
+    """
+    for _ in range(d):
+        x = x[..., 1:, :] - x[..., :-1, :]
+    for _ in range(D):
+        x = x[..., season_period:, :] - x[..., :-season_period, :]
+    return x
 
 
 def _format_options(options):
@@ -188,6 +204,24 @@ class SARIX():
         Day-of-year values (0-365) for each time point. Required if fourier_K > 0.
         Used to calculate Fourier seasonal features.
 
+    calendar_labels : array_like of int, optional
+        Calendar label (for example, for holiday effects) for each time point
+        and variable, including the forecast horizon, laid out like xy.
+        The shape will be broadcast to `batch_shape + (T + forecast_horizon, n_x + 1)`,
+        and must include the full time dimension, e.g. `(..., T + forecast_horizon, 1)`
+        or `(..., T + forecast_horizon, n_x + 1)`.
+        The leading batch dimensions may be omitted to share the labels across
+        batches, and a trailing dimension of length 1 (e.g. shape
+        (T + forecast_horizon, 1)) applies the same labels to all variables.
+        A 0 in any position means no effect; labels 1, ..., K each get a
+        separate multiplicative effect (see Notes). For example, the user
+        might place a 1 in each index of a Christmas week and 2 in each index
+        of a New Year's week. Each variable with any non-zero label gets its own
+        effects (see `calendar_variables` in Notes). To give holiday effects to only the
+        target and not to covariate series, pass shape
+        (..., T + forecast_horizon, n_x + 1) with 0 at all time points in the
+        exogenous variables' columns.
+
     **Model structure**
 
     p : int, default=1
@@ -214,6 +248,25 @@ class SARIX():
         - 'sqrt': Square root transformation
         - 'fourthrt': Fourth root transformation
         - 'log': Natural log transformation
+
+    input_power : float, optional
+        Only with transform='none'. Declares that xy was already transformed
+        before being passed to SARIX, so that each variable is
+        `a * u**input_power - input_center` for some positive quantity `u` on the
+        original scale and some `a > 0`. `input_power=0` means `a * log(u) -
+        input_center`. A scalar, or shape (n_x + 1,) for one power per
+        variable. Default 1 (xy is on the original scale). Calendar effects
+        multiply u, so they need to know this scale.
+
+    input_center : float or array_like, optional
+        Only with transform='none'. The centering constant in input_power's
+        description, applied *after* the power transformation.
+        One value per batch and variable: anything that broadcasts to
+        batch_shape + (n_x + 1,), e.g. a scalar, shape (n_x + 1,) for one
+        value per variable shared by all batches, or the full shape. Default
+        0. Only used for variables with calendar effects and a non-zero
+        power, where it must be finite; other values may be NaN (e.g. when a
+        variable's scale is unknown).
 
     fourier_K : int, default=0
         Number of Fourier harmonic pairs to include for seasonal patterns.
@@ -265,6 +318,22 @@ class SARIX():
           reported by MCMC and consider more warmup iterations if it is high.
         Required when include_intercept is True, must be None otherwise.
 
+    calendar_pooling : {'unshared', 'shared', 'partial'}, required if calendar_labels given
+        How to share calendar effects across batches.
+        - 'unshared': Separate effects per batch/location, each with prior
+          Normal(0, calendar_effect_sd), so they are all shrunk toward 0
+        - 'shared': Single set of effects shared across all batches
+        - 'partial': Separate effects per batch/location, each with prior
+          Normal(calendar_effect_mu, calendar_effect_sd), where
+          calendar_effect_mu is a learned mean for each variable and label.
+          Effects are shrunk toward that common effect rather than toward 0.
+          They are sampled non-centred, as calendar_effect_mu +
+          calendar_effect_sd * calendar_effect_decentered with
+          calendar_effect_decentered ~ Normal(0, 1), so that tightly
+          clustered effects (calendar_effect_sd near 0) do not cause
+          divergent transitions.
+        Required when calendar_labels is given, must be None otherwise.
+
     **Prior scales**
 
     sigma_prior_scale : float, default=1.0
@@ -294,6 +363,18 @@ class SARIX():
         this keeps the prior wide relative to the series' level. The resolved
         value is stored in the `intercept_mu_prior_scale` attribute.
 
+    calendar_effect_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the standard deviation of the
+        calendar effects.
+
+    calendar_effect_mu_prior_scale : float or array_like, default=1.0
+        Scale of the Normal(0, calendar_effect_mu_prior_scale) prior on the
+        common calendar effects. Only used when calendar_pooling='partial'.
+        May be a scalar or have shape (n_x + 1,) for a separate scale per
+        variable. The effects are log multipliers on the original scale, so
+        unlike intercept_mu_prior_scale the default does not depend on the
+        data.
+
     **Forecasting and MCMC**
 
     forecast_horizon : int, default=1
@@ -306,7 +387,8 @@ class SARIX():
         Number of MCMC samples to draw after warmup.
 
     num_chains : int, default=1
-        Number of MCMC chains to run.
+        Number of MCMC chains to run. After fitting, the number of divergent
+        transitions is stored in the `num_divergences` attribute.
 
     Notes
     -----
@@ -315,6 +397,26 @@ class SARIX():
         Σ_{k=1}^{K} [β_{sin,k} * sin(2πk*day/365.25) + β_{cos,k} * cos(2πk*day/365.25)]
 
     These terms are separate for each location (unpooled) and each variable.
+
+    **Calendar effects:**
+    A label k > 0 for variable j at a time point is taken to multiply that
+    variable's original-scale value by exp(eta_jk). The AR model is fitted to
+    the series with these effects divided out (the likelihood includes the
+    Jacobian of this adjustment), and forecasts at labelled time points are
+    multiplied back. The adjustment is made on the modeled scale using the
+    power and centre given by `transform` or by input_power and input_center.
+    With power 0 and data a * log(u) - c, eta_jk is a times the log
+    multiplier. The priors on the effects are described under
+    calendar_pooling and the calendar prior scales.
+
+    The `calendar_variables` attribute holds the indices of the variables
+    (columns of xy) with at least one non-zero label, and
+    n_adjusted = len(calendar_variables). The samples hold 'calendar_effect'
+    with shape (num_samples,) + batch_shape + (n_adjusted, K) ('unshared'
+    or 'partial') or (num_samples, n_adjusted, K) ('shared'), where K is the
+    largest label. With 'partial', 'calendar_effect_mu' and
+    'calendar_effect_decentered' are stored as well.
+    `predictions_modeled_scale` holds forecasts of the adjusted series.
 
     **Day-of-year format:**
     The day_of_year parameter expects integer values 0-365 (or 1-366).
@@ -344,6 +446,7 @@ class SARIX():
                  *,
                  # data
                  day_of_year=None,
+                 calendar_labels=None,
                  # model structure
                  p=1,
                  d=0,
@@ -351,6 +454,8 @@ class SARIX():
                  D=0,
                  season_period=1,
                  transform='none',
+                 input_power=None,
+                 input_center=None,
                  fourier_K=0,
                  include_intercept=False,
                  # pooling
@@ -358,12 +463,15 @@ class SARIX():
                  sigma_pooling='unshared',
                  fourier_pooling=None,
                  intercept_pooling=None,
+                 calendar_pooling=None,
                  # prior scales
                  sigma_prior_scale=1.0,
                  theta_sd_prior_scale=1.0,
                  fourier_beta_sd_prior_scale=1.0,
                  intercept_sd_prior_scale=1.0,
                  intercept_mu_prior_scale=None,
+                 calendar_effect_sd_prior_scale=1.0,
+                 calendar_effect_mu_prior_scale=1.0,
                  # forecasting and MCMC
                  forecast_horizon=1,
                  num_warmup=1000,
@@ -376,6 +484,8 @@ class SARIX():
         if intercept_pooling is not None:
             intercept_pooling = _validate_pooling(intercept_pooling, 'intercept_pooling',
                                                   INTERCEPT_POOLING_OPTIONS)
+        if calendar_pooling is not None:
+            calendar_pooling = _validate_pooling(calendar_pooling, 'calendar_pooling', CALENDAR_POOLING_OPTIONS)
 
         self.n_x = xy.shape[-1] - 1
         self.xy = xy.copy()
@@ -402,6 +512,16 @@ class SARIX():
         self.intercept_pooling = intercept_pooling
         self.intercept_sd_prior_scale = intercept_sd_prior_scale
         self.intercept_mu_prior_scale = intercept_mu_prior_scale
+        self.calendar_pooling = calendar_pooling
+        self.calendar_effect_sd_prior_scale = calendar_effect_sd_prior_scale
+        mu_scale = onp.asarray(calendar_effect_mu_prior_scale, dtype=float)
+        if mu_scale.shape not in ((), (xy.shape[-1],)):
+            raise ValueError(f"calendar_effect_mu_prior_scale must be a scalar or have shape (n_x + 1,) = "
+                             f"({xy.shape[-1]},), but got shape {mu_scale.shape}")
+        if onp.any(mu_scale <= 0):
+            raise ValueError("calendar_effect_mu_prior_scale must be positive")
+        self.calendar_effect_mu_prior_scale = onp.broadcast_to(mu_scale, (xy.shape[-1],))
+        self.input_power = input_power
 
         # Validate Fourier parameters
         if fourier_K > 0 and day_of_year is None:
@@ -468,6 +588,77 @@ class SARIX():
             # (also set for consistency when not using an intercept)
             self.intercept_batch_shape = batch_shape
 
+        # scale of each variable as modeled: power and centering constant
+        n_vars = self.n_x + 1
+        if transform not in TRANSFORM_POWERS:
+            raise ValueError(f"transform must be one of {tuple(TRANSFORM_POWERS)}")
+        if transform != 'none' and (input_power is not None or input_center is not None):
+            raise ValueError("input_power and input_center describe data transformed before being "
+                             "passed to SARIX and can only be used with transform='none'")
+        power = onp.asarray(TRANSFORM_POWERS[transform] if input_power is None else input_power, dtype=float)
+        if power.shape not in ((), (n_vars,)):
+            raise ValueError(f"input_power must be a scalar or have shape (n_x + 1,) = ({n_vars},), "
+                             f"but got shape {power.shape}")
+        if onp.any(power < 0):
+            raise ValueError("input_power must be non-negative")
+        self.scale_power = onp.broadcast_to(power, (n_vars,))
+        center_shape = batch_shape + (n_vars,)
+        try:
+            self.input_center = onp.broadcast_to(
+                onp.asarray(0.0 if input_center is None else input_center, dtype=float), center_shape)
+        except ValueError:
+            raise ValueError(f"input_center must broadcast to shape {center_shape} (batch_shape + (n_x + 1,))")
+
+        # calendar labels: integer array laid out like xy, batch_shape + (T + forecast_horizon, n_x + 1)
+        if calendar_labels is None:
+            if calendar_pooling is not None:
+                raise ValueError("calendar_pooling should not be specified when calendar_labels is None")
+            self.calendar_labels = None
+            self.n_calendar = 0
+        else:
+            if calendar_pooling is None:
+                raise ValueError("calendar_pooling must be specified when calendar_labels is given")
+            labels = onp.asarray(calendar_labels)
+
+            if not onp.issubdtype(labels.dtype, onp.integer):
+                raise ValueError("calendar_labels must be integers")
+            if labels.min() < 0:
+                raise ValueError("calendar_labels must be non-negative")
+
+            n_timepoints_total = xy.shape[-2] + forecast_horizon
+            if labels.ndim < 2 or labels.shape[-2] != n_timepoints_total or labels.shape[-1] not in (1, n_vars):
+                raise ValueError(
+                    f"calendar_labels must have shape (..., T + forecast_horizon, 1) or "
+                    f"(..., T + forecast_horizon, n_x + 1) = (..., {n_timepoints_total}, 1) or (..., {n_timepoints_total}, {n_vars}), "
+                    f"but got shape {labels.shape}")
+
+            try:
+                labels = onp.broadcast_to(labels, batch_shape + (n_timepoints_total, n_vars))
+            except ValueError:
+                raise ValueError(f"calendar_labels must broadcast to shape {batch_shape + (n_timepoints_total, n_vars)}")
+
+            self.n_calendar = int(labels.max())
+            if self.n_calendar == 0:
+                raise ValueError("calendar_labels has no non-zero labels")
+
+            # variables with any non-zero label get effects; the others are left unchanged
+            self.calendar_variables = onp.flatnonzero(labels.reshape(-1, n_vars).any(axis=0))
+            adjusted = self.calendar_variables
+            uses_center = adjusted[self.scale_power[adjusted] > 0]
+            if not onp.all(onp.isfinite(self.input_center[..., uses_center])):
+                raise ValueError("input_center must be finite for variables with calendar effects "
+                                 f"and a non-zero input_power (variables {uses_center.tolist()})")
+            # power and center of the adjusted variables, as used by _calendar_adjust. Centers
+            # are only used where the power is > 0; set them to 0 elsewhere so that a NaN center
+            # cannot reach the gradient through the unused branch of jnp.where
+            self._adjusted_power = self.scale_power[adjusted]  # (n_adjusted,)
+            self._adjusted_center = onp.where(self._adjusted_power > 0,
+                                              self.input_center[..., adjusted], 0.0)  # batch_shape + (n_adjusted,)
+            self.calendar_labels = labels
+            self._warn_unobserved_calendar_labels(labels, xy.shape[-2], calendar_pooling)
+        # separate effects per batch for 'unshared' and 'partial'
+        self.calendar_batch_shape = () if calendar_pooling == 'shared' else batch_shape
+
         # do transformation
         self.xy_orig = xy.copy()
         if transform == "sqrt":
@@ -491,8 +682,9 @@ class SARIX():
             self.fourier_features = None
 
         # do differencing; save xy before differencing for later use when
-        # inverting differencing
-        transformed_xy = self.xy
+        # inverting differencing (and, with calendar effects, for adjusting
+        # the series inside the model before differencing)
+        self.xy_transformed = self.xy
         self.xy = diff(self.xy, self.d, self.D, self.season_period, pad_na=False)
 
         # set a data-based scale for the intercept_mu prior if not provided;
@@ -507,8 +699,9 @@ class SARIX():
             self.fourier_features = self.fourier_features[n_diff:, :]
 
         # pre-calculate state update matrix; there is none when the model has
-        # no autoregressive terms (p=0 and P=0)
-        if self.max_lag > 0:
+        # no autoregressive terms (p=0 and P=0). With calendar effects the
+        # lagged values depend on the effects and are built inside the model.
+        if self.max_lag > 0 and self.calendar_labels is None:
             self.update_X = self.state_update_X(self.xy[..., :self.max_lag, :],
                                                 self.xy[..., self.max_lag:, :])
         else:
@@ -521,10 +714,16 @@ class SARIX():
         # generate predictions
         self.predictions_modeled_scale = self.predict(rng_key_predict)
 
-        # undo differencing
-        self.predictions = inv_diff(transformed_xy,
+        # undo differencing (with calendar effects, of the adjusted series,
+        # whose recent values depend on the sampled effects)
+        self.predictions = inv_diff(self.xy_transformed if self.calendar_labels is None else self._calendar_base,
                                     self.predictions_modeled_scale,
                                     self.d, self.D, self.season_period)
+
+        # undo the calendar adjustment at forecast time points with labels
+        if self.calendar_labels is not None:
+            self.predictions = onp.asarray(self._calendar_adjust(
+                self.predictions, self._calendar_future_offsets, inverse=True))
 
         # undo transformation to get predictions on original scale
         if transform == "log":
@@ -609,6 +808,7 @@ class SARIX():
         mcmc.print_summary()
         print('\nMCMC elapsed time:', time.time() - start)
         self.samples = mcmc.get_samples()
+        self.num_divergences = int(mcmc.get_extra_fields()['diverging'].sum())
 
 
     def make_state_transition_matrix(self, theta):
@@ -686,7 +886,199 @@ class SARIX():
             axis=-2)
 
 
+    def _warn_unobserved_calendar_labels(self, labels, T, pooling):
+        """
+        Warn about calendar effects that no modeled time point informs, so
+        that they are drawn from the prior. There is one effect per variable
+        with calendar effects and label 1, ..., K. An effect is uninformed if
+        its label never occurs for that variable, or occurs only in the
+        forecast horizon or in the first d + D * season_period + max_lag time
+        points, which the likelihood conditions on. With 'unshared' pooling,
+        each batch has its own effects, so this is checked per batch.
+        labels has shape batch_shape + (T + forecast_horizon, n_x + 1).
+        """
+        K = self.n_calendar
+        ks = onp.arange(1, K + 1)
+        n_skip = self.d + self.D * self.season_period + self.max_lag
+
+        def occurs(lab):
+            """
+            For labels lab with shape batch_shape + (n_time, n_x + 1), return
+            a boolean array with shape (n_batches, n_x + 1, K) that is True
+            where label k occurs at some time point for that batch and
+            variable.
+            """
+            lab = lab.reshape((-1,) + lab.shape[-2:])  # flatten batch dims: (n_batches, n_time, n_x + 1)
+            is_k = lab[..., None] == ks  # (n_batches, n_time, n_x + 1, K)
+            return is_k.any(axis=1)  # any time point
+
+        # whether each label occurs for each variable anywhere (any time point and batch): (n_x + 1, K)
+        anywhere = occurs(labels).any(axis=0)
+        # whether each label occurs at a modeled time point, per batch: (n_batches, n_x + 1, K)
+        observed = occurs(labels[..., n_skip:T, :])
+        # with 'shared' pooling, the batches share the effects, and with 'partial' pooling, each batch's effects
+        # are informed through the common mean by any batch, so one batch with the label is enough
+        if pooling in ('shared', 'partial'):
+            observed = observed.any(axis=0, keepdims=True)
+        n_batches = observed.shape[0]
+        n_unobserved = (~observed).sum(axis=0)  # number of batches without the label: (n_x + 1, K)
+
+        never, unobserved = [], []
+        for j in self.calendar_variables:
+            missing = [int(k) for k in ks if not anywhere[j, k - 1]]
+            if missing:
+                never.append(f"variable {j}: labels {missing}")
+            parts = [f"label {k}" + (f" ({n_unobserved[j, k - 1]} of {n_batches} batches)" if pooling == 'unshared'
+                                     else "")
+                     for k in ks if anywhere[j, k - 1] and n_unobserved[j, k - 1] > 0]
+            if parts:
+                unobserved.append(f"variable {j}: " + ", ".join(parts))
+        if never:
+            warnings.warn(f"some calendar labels never occur (labels run from 1 to {K}): {'; '.join(never)}; "
+                          "their effects are drawn from the prior")
+        if unobserved:
+            warnings.warn(f"some calendar labels occur only in the forecast horizon or the first {n_skip} time "
+                          f"points (which the likelihood conditions on): {'; '.join(unobserved)}; "
+                          "their effects are drawn from the prior")
+
+
+    def _calendar_offsets(self, effect, n_sample_dims):
+        """
+        Map sampled calendar effects to time points.
+
+        effect has shape sample_shape + self.calendar_batch_shape + (n_adjusted, K),
+        with n_sample_dims leading sample dimensions, where
+        n_adjusted = len(self.calendar_variables). Returns eta at every time
+        point for each variable with calendar effects (0 where the label is 0),
+        with shape sample_shape + batch_shape + (T + forecast_horizon, n_adjusted).
+        """
+        sample_shape = effect.shape[:n_sample_dims]
+        labels = self.calendar_labels[..., self.calendar_variables]  # batch_shape + (T + h, n_adjusted)
+        batch_shape = labels.shape[:-2]
+        if self.calendar_pooling == 'shared':
+            # no batch dimensions in effect; insert size-1 ones so it broadcasts over batches
+            effect = effect.reshape(sample_shape + (1,) * len(batch_shape) + effect.shape[-2:])
+        # full is a lookup table from label to effect: full[..., j, k] is the effect of label k
+        # for adjusted variable j, with a 0 prepended in the first position of the last axis
+        # for label 0 (no effect), so the labels can be used directly as indices.
+        # Shape sample_shape + batch_shape + (n_adjusted, K + 1), with size-1 batch
+        # dimensions under 'shared' pooling.
+        full = jnp.concatenate([jnp.zeros(effect.shape[:-1] + (1,)), effect], axis=-1)
+        # take_along_axis needs the same number of dimensions as full; it broadcasts the rest
+        # after swapaxes + reshape, dimensions are broadcastable to sample_shape + batch_shape + (n_adjusted, T + h)
+        labels = jnp.swapaxes(labels, -1, -2)  # batch_shape + (n_adjusted, T + h), to index full's last axis
+        labels = labels.reshape((1,) * len(sample_shape) + labels.shape)
+        # look up each time point's effect in full: eta[..., j, t] = full[..., j, labels[..., j, t]],
+        # then swap back to time before variable: sample_shape + batch_shape + (T + h, n_adjusted)
+        return jnp.swapaxes(jnp.take_along_axis(full, labels, axis=-1), -1, -2)
+
+
+    def _calendar_adjust(self, xy, offsets, inverse=False):
+        """
+        Divide (or, with inverse=True, multiply) the original-scale quantity of
+        each variable with calendar effects by exp(offsets), working on the
+        modeled scale. xy has shape (..., T, n_x + 1) and offsets shape
+        (..., T, n_adjusted); their leading dimensions broadcast. Variables
+        without calendar effects are unchanged.
+        """
+        idx = self.calendar_variables
+        y = xy[..., idx]
+        sign = 1.0 if inverse else -1.0
+        lam = jnp.asarray(self._adjusted_power)
+        c = jnp.asarray(self._adjusted_center)[..., None, :]  # batch_shape + (1, n_adjusted), broadcasts over time
+
+        # Write the modeled scale as y = a * u**lam - c (lam > 0) or y = a * log(u) - c (lam == 0),
+        # where u is the positive original-scale quantity. We want z, the same transform of
+        # u multiplied by the calendar effect (exp(sign * eta) with eta = offsets for lam > 0;
+        # see below for lam == 0).
+        # With sign = -1 (inverse=False) this removes the effects: y is observed, z is adjusted.
+        # With sign = +1 (inverse=True) it restores them: the input is adjusted and the output is
+        # on the observed scale. Applying one after the other gives back the input.
+        # - lam > 0: y = a * u**lam - c, so
+        #   z = a * [u * exp(sign * eta)]**lam - c
+        #     = a * u**lam * exp(sign * eta * lam) - c
+        #     = exp(sign * lam * eta) * (y + c) - c.
+        #   The center c is needed but a is not.
+        # - lam == 0: y = a * log(u) - c, so
+        #   z = a * log(u * exp(sign * \tilde{eta})) - c
+        #     = a * log(u) + a * sign * \tilde{eta} - c
+        #     = y + a * sign * \tilde{eta}
+        #   a is unknown, so eta is defined on this scale (eta = a * \tilde{eta}; see the class Notes):
+        #       z = y + sign * eta,
+        #   which needs neither a nor c.
+        # The lam > 0 formula does not reduce to this one as lam -> 0 (it would give z = y),
+        # so the two cases are computed separately.
+        z = jnp.where(lam == 0, y + sign * offsets, jnp.exp(sign * lam * offsets) * (y + c) - c)
+        out_shape = jnp.broadcast_shapes(xy.shape, z.shape[:-1] + xy.shape[-1:])
+        return jnp.broadcast_to(xy, out_shape).at[..., idx].set(jnp.broadcast_to(z, out_shape[:-1] + (len(idx),)))
+
+
+    def _calendar_model_data(self):
+        """
+        Sample the calendar effects and return the adjusted, differenced
+        series and its lagged-value matrix (None if there are no AR terms).
+        Adds the log Jacobian of the adjustment for the modeled time points.
+        """
+        effect_sd = numpyro.sample(
+            "calendar_effect_sd",
+            dist.HalfCauchy(self.calendar_effect_sd_prior_scale * jnp.ones(1))
+        )
+        effect_shape = self.calendar_batch_shape + (len(self.calendar_variables), self.n_calendar)
+        if self.calendar_pooling == 'partial':
+            # learned mean for each variable and label, shared across batches; each batch's effects are
+            # shrunk toward it. Non-centred: effect = mu + sd * decentered with decentered ~ Normal(0, 1),
+            # which avoids the funnel between the effects and effect_sd when effect_sd is near 0
+            mu_scale = self.calendar_effect_mu_prior_scale[self.calendar_variables][:, None]
+            effect_mu = numpyro.sample(
+                "calendar_effect_mu",
+                dist.Normal(loc=jnp.zeros(effect_shape[-2:]), scale=mu_scale)
+            )
+            decentered = numpyro.sample("calendar_effect_decentered", dist.Normal(jnp.zeros(effect_shape), 1.0))
+            effect = numpyro.deterministic("calendar_effect", effect_mu + effect_sd * decentered)
+        else:
+            effect = numpyro.sample(
+                "calendar_effect",
+                dist.Normal(loc=jnp.zeros(effect_shape), scale=effect_sd)
+            )
+        T = self.xy_transformed.shape[-2]
+        offsets = self._calendar_offsets(effect, 0)[..., :T, :]
+        z = self._calendar_adjust(jnp.asarray(self.xy_transformed), offsets)
+
+        # Jacobian of the calendar adjustment. The AR likelihood below is written for z, the
+        # adjusted series, but the data are y, and z = z(y; eta) depends on the parameters eta.
+        # The density of the data is therefore
+        #     p(y | theta, eta) = p_AR(z(y; eta) | theta, eta) * |dz/dy|,
+        # the usual change-of-variables formula. Without the |dz/dy| factor, the model could raise
+        # its likelihood by choosing eta to shrink z towards -c, rather than by fitting the data.
+        # The adjustment acts on each time point and variable separately, so the Jacobian is
+        # diagonal and log |dz/dy| is a sum over elements of
+        #     log(dz/dy) = log(exp(-lam_j * eta)) = -lam_j * eta    (lam_j > 0),
+        #     log(dz/dy) = log(1) = 0                              (lam_j == 0, where z = y - eta),
+        # and the second case is covered by the same expression because lam_j = 0.
+        # Only the time points the likelihood scores count: the first d + D * season_period +
+        # max_lag are conditioned on (they start the differencing and the AR lags), not modeled.
+        # Differencing itself has Jacobian 1, so it adds nothing.
+        # numpyro.factor adds an arbitrary term to the model's log density (here, log |dz/dy|),
+        # alongside the log-likelihood and log-prior terms from numpyro.sample sites.
+        n_skip = self.d + self.D * self.season_period + self.max_lag
+        lam = jnp.asarray(self._adjusted_power)
+        numpyro.factor("calendar_log_jacobian", -jnp.sum(lam * offsets[..., n_skip:, :]))
+
+        xy = _diff_jnp(z, self.d, self.D, self.season_period)
+        if self.max_lag > 0:
+            update_X = self.state_update_X(xy[..., :self.max_lag, :], xy[..., self.max_lag:, :])
+        else:
+            update_X = None
+        return xy, update_X
+
+
     def model(self, xy):
+        # with calendar effects, the modeled series depends on the effects
+        if self.calendar_labels is not None:
+            xy, update_X = self._calendar_model_data()
+        else:
+            update_X = self.update_X
+
         # Vector of innovation standard deviations for the n_x + 1 variables
         sigma = numpyro.sample(
             "sigma",
@@ -721,7 +1113,7 @@ class SARIX():
             A = self.make_state_transition_matrix(theta)
 
             # predictive means based on AR structure
-            step_means = jnp.matmul(self.update_X, A)
+            step_means = jnp.matmul(update_X, A)
         else:
             # no autoregressive terms (p=0 and P=0); the predictive mean comes
             # only from the intercept and Fourier terms below, if present
@@ -836,6 +1228,23 @@ class SARIX():
         # convert sigma to a batch of covariance matrix Cholesky factors
         Sigma_chol = jnp.expand_dims(sigma, -2) * jnp.eye(sigma.shape[-1])
 
+        # with calendar effects, the recent (adjusted, differenced) values the
+        # forecasts start from depend on the sampled effects; only the last
+        # d + D * season_period + max_lag time points are needed
+        if self.calendar_labels is not None:
+            offsets = self._calendar_offsets(self.samples['calendar_effect'], 1)
+            T = self.xy_transformed.shape[-2]
+            n_diff = self.d + self.D * self.season_period
+            n_tail = n_diff + self.max_lag
+            z_tail = self._calendar_adjust(jnp.asarray(self.xy_transformed[..., T - n_tail:, :]),
+                                           offsets[..., T - n_tail:T, :])
+            # recent values of the original-scale series for inverting differencing
+            self._calendar_base = onp.asarray(z_tail[..., n_tail - n_diff:, :])
+            self._calendar_future_offsets = offsets[..., T:, :]
+            lag_source = _diff_jnp(z_tail, self.d, self.D, self.season_period)
+        else:
+            lag_source = self.xy
+
         # Load intercepts if present
         if self.include_intercept:
             intercept = self.samples['intercept']
@@ -904,7 +1313,7 @@ class SARIX():
         y_pred = []
         dummy_values = jnp.zeros(batch_shape + (1, self.xy.shape[-1]))
         if self.max_lag > 0:
-            recent_lags = jnp.broadcast_to(self.xy[..., -self.max_lag:, :],
+            recent_lags = jnp.broadcast_to(lag_source[..., -self.max_lag:, :],
                                            batch_shape + (self.max_lag, self.xy.shape[-1]))
         for h in range(self.forecast_horizon):
             # AR contribution
