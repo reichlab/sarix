@@ -8,6 +8,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Calendar effects** (e.g. holidays): new `calendar_labels` parameter, an integer array laid out like `xy`
+  over the data and forecast time points (0 = no effect, 1..K = a multiplicative effect). Each variable with
+  a non-zero label gets its own effects (listed in the new `calendar_variables` attribute); a trailing label
+  axis of 1 gives effects to every variable, covariates included. The likelihood includes the Jacobian of
+  the adjustment, and forecasts at labelled time points are mapped back. See the class docstring.
+  - New `calendar_pooling` parameter (`'unshared'`, `'shared'` or `'partial'`), required with
+    `calendar_labels`. Effects are separate for each batch under `'unshared'` and `'partial'`; `'partial'`
+    shrinks them toward a learned common effect `calendar_effect_mu` (non-centred parameterization)
+  - New `calendar_effect_sd_prior_scale` and `calendar_effect_mu_prior_scale` parameters
+  - Warns when an effect's label never occurs in the data time points (or only in the forecast horizon),
+    so that the effect is drawn from the prior, and when a variable with effects and power > 0 takes values
+    below `-input_center`, which cannot come from a positive quantity on the original scale
+- **Input scale description**: new `input_power` and `input_center` parameters (only with
+  `transform='none'`) declare that `xy` was power-transformed (power 0 = log) and centred before being
+  passed to SARIX. They are used only by calendar effects, which then act as multipliers on the original
+  scale (with power 0, on the scale of `xy`)
+- **Divergence count**: the number of divergent MCMC transitions is stored in the new `num_divergences` attribute
 - **Models with no autoregressive terms**: SARIX now supports `p=0` and `P=0`, where the predictive mean
   comes only from the intercept and/or Fourier terms. `theta` and `theta_sd` are not sampled in this case.
 - **Optional intercept**: New `include_intercept` parameter adds an intercept for each variable
@@ -29,6 +46,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reordered into groups: data (`day_of_year`), model structure, pooling, prior scales, and
   forecasting/MCMC settings. Code that passes these arguments by name is unaffected; code that
   passes them by position now raises a `TypeError`.
+- An unknown `transform` value now raises a `ValueError` instead of being treated as `'none'`.
 
 ### Deprecated
 - The `'none'` option for `theta_pooling`, `sigma_pooling`, `fourier_pooling` and `intercept_pooling`
