@@ -81,27 +81,39 @@ def _fit_with_labels(lab, pooling='shared', T=30, h=2):
 def test_warns_on_label_gaps():
     lab = np.zeros(32, dtype=int)
     lab[[5, 10, 15]] = [1, 2, 4]
-    with pytest.warns(UserWarning, match=r"never occur .*variable 0: labels \[3\]"):
+    with pytest.warns(UserWarning, match=r"no observations .*labels run from 1 to 4.*: variable 0: label 3$"):
         m = _fit_with_labels(lab)
     assert m.samples['calendar_effect'].shape == (20, 1, 4)
 
 
 @pytest.mark.parametrize("pooling", ["shared", "partial"])
-@pytest.mark.parametrize("where", [0, 30])  # conditioned on (p=1, d=0); forecast horizon
-def test_warns_on_labels_without_modeled_observations(where, pooling):
+def test_warns_on_labels_only_in_forecast_horizon(pooling):
     lab = np.zeros(32, dtype=int)
-    lab[[5, where]] = [1, 2]
+    lab[[5, 30]] = [1, 2]
     # no per-batch counts unless the batches have separate effects ('unshared')
-    with pytest.warns(UserWarning, match=r"forecast horizon or the first 1 time points .*: variable 0: label 2;"):
+    with pytest.warns(UserWarning, match=r"only in the forecast horizon\): variable 0: label 2$"):
         _fit_with_labels(lab, pooling=pooling)
 
 
-def test_unobserved_labels_checked_per_batch_when_unshared():
+@pytest.mark.parametrize("pooling", ["shared", "partial"])
+def test_no_warning_for_labels_in_first_time_points(pooling):
+    """The first d + D * season_period + max_lag time points enter the likelihood through the differences
+    and lags of the first modeled step, so their effects are informed by the data."""
+    lab = np.zeros(32, dtype=int)
+    lab[[5, 0]] = [1, 2]
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        _fit_with_labels(lab, pooling=pooling)
+
+
+@pytest.mark.parametrize("batch_1_where", [31, None])  # forecast horizon; absent
+def test_unobserved_labels_checked_per_batch_when_unshared(batch_1_where):
     lab = np.zeros((2, 32), dtype=int)
     lab[:, 5] = 1
     lab[0, 10] = 2  # label 2 observed for batch 0 only
-    lab[1, 31] = 2
-    with pytest.warns(UserWarning, match=r"variable 0: label 2 \(1 of 2 batches\)"):
+    if batch_1_where is not None:
+        lab[1, batch_1_where] = 2
+    with pytest.warns(UserWarning, match=r"variable 0: label 2 \(missing in 1 of 2 batches\)$"):
         _fit_with_labels(lab, pooling='unshared')
     for pooling in ('shared', 'partial'):  # informed by batch 0 (directly, or through the common mean)
         with warnings.catch_warnings():
@@ -135,7 +147,7 @@ def test_label_gaps_checked_per_variable():
     lab = np.zeros((T + h, 2), dtype=int)
     lab[5, :] = 1
     lab[10, 1] = 2  # label 2 only for the target
-    with pytest.warns(UserWarning, match=r"never occur .*variable 0: labels \[2\]") as rec:
+    with pytest.warns(UserWarning, match=r"no observations .*: variable 0: label 2$") as rec:
         SARIX(xy2(T=T), p=1, theta_pooling='shared', sigma_pooling='shared', calendar_labels=lab,
               calendar_pooling='shared', forecast_horizon=h, **FAST)
     assert not any("variable 1" in str(w.message) for w in rec)
@@ -429,3 +441,39 @@ def test_partial_pooling_recovers_effects_without_divergences(effect_sd):
     assert np.mean((lo <= eta) & (eta <= hi)) >= 0.85  # 95% intervals for the 20 batch-level effects
     sd_s = np.asarray(m.samples['calendar_effect_sd'])[:, 0]
     assert np.quantile(sd_s, 0.025) <= effect_sd + 0.02 and effect_sd <= np.quantile(sd_s, 0.975) + 0.02
+
+
+# ---------------------------------------------------------------------------------------------
+# input checks and output types
+# ---------------------------------------------------------------------------------------------
+
+
+def test_diff_accepts_array_likes():
+    import pandas as pd
+
+    from sarix.sarix import diff
+
+    x = np.arange(20.0).reshape(10, 2) ** 2
+    expect = np.diff(x, n=2, axis=0)
+    np.testing.assert_allclose(diff(x.tolist(), d=2), expect)
+    np.testing.assert_allclose(diff(pd.DataFrame(x), d=2), expect)
+
+
+def test_warns_when_values_below_negative_center():
+    """With power > 0, xy + input_center < 0 cannot come from a positive original-scale quantity."""
+    xy = ar1_data(B=2, T=30)[..., None]  # centred around 0
+    with pytest.warns(UserWarning, match=r"variables \[0\] have calendar effects but take values below"):
+        _ = SARIX(xy, p=1, theta_pooling='shared', sigma_pooling='shared', calendar_labels=cal(labels(30, 1)),
+                  calendar_pooling='shared', forecast_horizon=1, **FAST)
+    with warnings.catch_warnings():  # the same data with a centre that makes them positive
+        warnings.simplefilter("error")
+        SARIX(xy, p=1, theta_pooling='shared', sigma_pooling='shared', input_center=5.0,
+              calendar_labels=cal(labels(30, 1)), calendar_pooling='shared', forecast_horizon=1, **FAST)
+
+
+@pytest.mark.parametrize("transform", ["sqrt", "fourthrt"])
+def test_predictions_are_numpy_arrays(transform):
+    xy = ar1_data(B=2, T=30)[..., None] + 5.0
+    m = SARIX(xy, p=1, transform=transform, theta_pooling='shared', sigma_pooling='shared', calendar_labels=cal(labels(30, 1)),
+              calendar_pooling='shared', forecast_horizon=1, **FAST)
+    assert type(m.predictions) is np.ndarray
