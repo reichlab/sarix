@@ -162,6 +162,18 @@ def _per_variable(value, name, n_vars):
     return value
 
 
+def _all_positive(value):
+    """
+    Whether value (a scalar or array) is positive and finite everywhere. None
+    and non-numeric values give False.
+    """
+    try:
+        value = onp.asarray(value, dtype=float)
+    except (TypeError, ValueError):
+        return False
+    return bool(onp.all(onp.isfinite(value) & (value > 0)))
+
+
 def _log_df_excess_moments(df_prior_scale):
     """
     Mean and standard deviation of log(df - 2) when df has the
@@ -645,8 +657,11 @@ class SARIX():
             # a new parameter: the deprecated 'none' alias is not accepted
             innovation_df_pooling = _validate_pooling(innovation_df_pooling, 'innovation_df_pooling',
                                                       PARTIAL_POOLING_OPTIONS, allow_none_alias=False)
-        if innovation_df_prior_scale <= 0 or innovation_df_sd_prior_scale <= 0:
-            raise ValueError("innovation_df_prior_scale and innovation_df_sd_prior_scale must be positive")
+        # the prior scales are only checked when they are used; NaN, inf and None are rejected
+        if innovation_dist == 't' and not _all_positive(innovation_df_prior_scale):
+            raise ValueError("innovation_df_prior_scale must be positive and finite")
+        if innovation_df_pooling == 'partial' and not _all_positive(innovation_df_sd_prior_scale):
+            raise ValueError("innovation_df_sd_prior_scale must be positive and finite")
         self.innovation_dist = innovation_dist
         self.innovation_df_pooling = innovation_df_pooling
         self.innovation_df_prior_scale = innovation_df_prior_scale

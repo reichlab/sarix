@@ -30,11 +30,28 @@ def ar1_data(B=2, T=60, phi=0.7, sd=0.1, seed=0):
         (dict(innovation_df_pooling='shared'), "innovation_df_pooling should not be specified"),
         (dict(innovation_dist='t', innovation_df_pooling='bogus'), "must be 'unshared', 'shared' or 'partial'"),
         (dict(innovation_dist='t', innovation_df_pooling='shared', innovation_df_prior_scale=0.0), "must be positive"),
+        (dict(innovation_dist='t', innovation_df_pooling='shared', innovation_df_prior_scale=float('nan')),
+         "innovation_df_prior_scale must be positive and finite"),
+        (dict(innovation_dist='t', innovation_df_pooling='shared', innovation_df_prior_scale=None),
+         "innovation_df_prior_scale must be positive and finite"),
+        (dict(innovation_dist='t', innovation_df_pooling='partial', innovation_df_sd_prior_scale=float('inf')),
+         "innovation_df_sd_prior_scale must be positive and finite"),
     ],
 )
 def test_validation(kwargs, match):
     with pytest.raises(ValueError, match=match):
         SARIX(ar1_data(T=30), p=1, **FAST, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        dict(innovation_df_prior_scale=None, innovation_df_sd_prior_scale=None),  # normal innovations: unused
+        dict(innovation_dist='t', innovation_df_pooling='shared', innovation_df_sd_prior_scale=float('nan')),
+    ],
+)
+def test_unused_prior_scales_are_not_validated(kwargs):
+    SARIX(ar1_data(T=30), p=1, **FAST, **kwargs)
 
 
 @pytest.mark.parametrize(
