@@ -8,6 +8,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **t-distributed innovations**: new `innovation_dist` parameter (`'normal'`, the default, or `'t'`). With
+  `'t'`, innovations are multivariate Student's t with `innovation_df` > 2 degrees of freedom, standardized so
+  that `sigma` remains the innovation standard deviation. The prior on `innovation_df` is Gamma(2, 1 /
+  `innovation_df_prior_scale`) (Juárez and Steel, 2010; default scale 10) truncated to values above 2, so the
+  variance is finite
+  - New `innovation_df_pooling` parameter (`'unshared'`, `'shared'` or `'partial'`), required with
+    `innovation_dist='t'`. `'partial'` shrinks each batch's log(`innovation_df` - 2) toward a learned common
+    value (non-centred), with spread given a HalfCauchy(`innovation_df_sd_prior_scale`) prior. The deprecated
+    alias `'none'` is not accepted
+  - The samples hold `innovation_df` and `innovation_df_excess` (`innovation_df` - 2). The model works with
+    `innovation_df_excess`, so the likelihood stays finite when `innovation_df` is very close to 2 in float32
 - **Calendar effects** (e.g. holidays): new `calendar_labels` parameter, an integer array laid out like `xy`
   over the data and forecast time points (0 = no effect, 1..K = a multiplicative effect). Each variable with
   a non-zero label gets its own effects (listed in the new `calendar_variables` attribute); a trailing label

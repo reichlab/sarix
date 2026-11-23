@@ -162,20 +162,48 @@ def _per_variable(value, name, n_vars):
     return value
 
 
+def _log_df_excess_moments(df_prior_scale):
+    """
+    Mean and standard deviation of log(df - 2) when df has the
+    Gamma(2, 1 / df_prior_scale) distribution truncated to df > 2, computed by
+    numerical integration over u = log(df - 2).
+    """
+    u = onp.linspace(-30.0, onp.log(100.0 * df_prior_scale), 200001)
+    df = 2.0 + onp.exp(u)
+    # Gamma(2, rate) density is proportional to df * exp(-rate * df); times d df / du = exp(u)
+    log_dens = onp.log(df) - df / df_prior_scale + u
+    w = onp.exp(log_dens - log_dens.max())
+    w /= w.sum()
+    mean = onp.sum(w * u)
+    return mean, onp.sqrt(onp.sum(w * (u - mean) ** 2))
+
+
+def _standardized_t_scale_tril(scale_tril, df_excess):
+    """
+    Scale factor of a multivariate t with df = 2 + df_excess degrees of freedom
+    whose covariance is scale_tril @ scale_tril.T:
+    scale_tril * sqrt((df - 2) / df). Taking df_excess = df - 2 rather than df
+    avoids rounding df - 2 to 0 in float32 when df is close to 2.
+    df_excess broadcasts against the batch shape of scale_tril.
+    """
+    factor = jnp.sqrt(df_excess / (2.0 + df_excess))
+    return scale_tril * factor[..., None, None]
+
+
 def _format_options(options):
     """Format pooling options for an error message, e.g. "'a', 'b' or 'c'"."""
     quoted = [f"'{option}'" for option in options]
     return ", ".join(quoted[:-1]) + " or " + quoted[-1]
 
 
-def _validate_pooling(value, name, options=POOLING_OPTIONS):
+def _validate_pooling(value, name, options=POOLING_OPTIONS, allow_none_alias=True):
     """
     Validate a pooling option and return it as a plain string.
 
-    The deprecated value 'none' is accepted as an alias for 'unshared' with a
-    FutureWarning.
+    If allow_none_alias, the deprecated value 'none' is accepted as an alias
+    for 'unshared' with a FutureWarning.
     """
-    if value == 'none':
+    if allow_none_alias and value == 'none':
         warnings.warn(
             f"{name}='none' is deprecated and will be removed in a future "
             f"release; use {name}='unshared' instead.",
@@ -295,8 +323,9 @@ class SARIX():
 
     **Pooling**
 
-    For all pooling arguments, the deprecated value 'none' is accepted as an
-    alias for 'unshared' and emits a FutureWarning.
+    For all pooling arguments except innovation_df_pooling, the deprecated
+    value 'none' is accepted as an alias for 'unshared' and emits a
+    FutureWarning.
 
     theta_pooling : {'unshared', 'shared'}, default='unshared'
         How to share AR coefficients across batches.
@@ -394,14 +423,37 @@ class SARIX():
 
     innovation_dist : {'normal', 't'}, default='normal'
         Distribution of the innovations.
-        - 'normal': multivariate normal.
-        - 't': multivariate Student's t, with heavier tails.
+        - 'normal': multivariate normal with standard deviations sigma.
+        - 't': multivariate Student's t with innovation_df > 2 degrees of
+          freedom, standardized so that sigma is still the standard deviation:
+          its scale is sigma * sqrt((innovation_df - 2) / innovation_df). The
+          tails are heavier than the normal's, with the same variance.
+
+    innovation_df_pooling : {'unshared', 'shared', 'partial'}, required if innovation_dist='t'
+        How to share the degrees of freedom of t innovations across batches.
+        - 'unshared': Separate df per batch/location, each with the prior below
+        - 'shared': Single df shared across all batches, with the prior below
+        - 'partial': Separate df per batch/location, shrunk toward a common
+          value: log(innovation_df - 2) = innovation_df_mu + innovation_df_sd *
+          innovation_df_decentered with innovation_df_decentered ~ Normal(0, 1)
+          (non-centred). innovation_df_mu has a Normal prior with the mean and
+          standard deviation of log(df - 2) under the prior below, and
+          innovation_df_sd ~ HalfCauchy(innovation_df_sd_prior_scale).
+        Required when innovation_dist='t', must be None otherwise. The deprecated
+        alias 'none' is not accepted. The samples hold innovation_df and
+        innovation_df_excess = innovation_df - 2 (used for computation, as it
+        keeps its precision when innovation_df is close to 2).
 
     innovation_df_prior_scale : float, default=10.0
-        Scale of the Gamma(2, 1 / innovation_df_prior_scale) prior on the
-        degrees of freedom of the t innovations, which has mean
-        2 * innovation_df_prior_scale. The degrees of freedom are estimated
-        separately for each batch. Ignored when innovation_dist='normal'.
+        The prior on the degrees of freedom is Gamma(2, 1 / innovation_df_prior_scale)
+        (shape 2, scale innovation_df_prior_scale; Juarez and Steel, 2010)
+        truncated to df > 2, which keeps the innovation variance finite. With the
+        default, its median is about 17 and its mean about 20.
+
+    innovation_df_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on innovation_df_sd, the spread of
+        log(innovation_df - 2) across batches. Only used when
+        innovation_df_pooling='partial'.
 
     **Forecasting and MCMC**
 
@@ -532,7 +584,9 @@ class SARIX():
                  calendar_effect_mu_prior_scale=1.0,
                  # innovation distribution
                  innovation_dist='normal',
+                 innovation_df_pooling=None,
                  innovation_df_prior_scale=10.0,
+                 innovation_df_sd_prior_scale=1.0,
                  # forecasting and MCMC
                  forecast_horizon=1,
                  num_warmup=1000,
@@ -579,12 +633,28 @@ class SARIX():
         if onp.any(mu_scale <= 0):
             raise ValueError("calendar_effect_mu_prior_scale must be positive")
         self.calendar_effect_mu_prior_scale = onp.broadcast_to(mu_scale, (xy.shape[-1],))
-        self.innovation_dist = innovation_dist
-        self.innovation_df_prior_scale = innovation_df_prior_scale
 
         # Validate innovation distribution parameters
-        if innovation_dist not in ['normal', 't']:
+        if innovation_dist not in ('normal', 't'):
             raise ValueError("innovation_dist must be 'normal' or 't'")
+        if innovation_dist == 't' and innovation_df_pooling is None:
+            raise ValueError("innovation_df_pooling must be specified when innovation_dist='t'")
+        if innovation_dist == 'normal' and innovation_df_pooling is not None:
+            raise ValueError("innovation_df_pooling should not be specified when innovation_dist='normal'")
+        if innovation_df_pooling is not None:
+            # a new parameter: the deprecated 'none' alias is not accepted
+            innovation_df_pooling = _validate_pooling(innovation_df_pooling, 'innovation_df_pooling',
+                                                      PARTIAL_POOLING_OPTIONS, allow_none_alias=False)
+        if innovation_df_prior_scale <= 0 or innovation_df_sd_prior_scale <= 0:
+            raise ValueError("innovation_df_prior_scale and innovation_df_sd_prior_scale must be positive")
+        self.innovation_dist = innovation_dist
+        self.innovation_df_pooling = innovation_df_pooling
+        self.innovation_df_prior_scale = innovation_df_prior_scale
+        self.innovation_df_sd_prior_scale = innovation_df_sd_prior_scale
+        if innovation_df_pooling == 'partial':
+            # prior on the common mean of log(df - 2): the mean and sd of log(df - 2) under the
+            # (truncated Gamma) prior used for df with 'unshared' and 'shared' pooling
+            self.innovation_df_mu_prior = _log_df_excess_moments(innovation_df_prior_scale)
 
         # Validate Fourier parameters
         if fourier_K > 0 and day_of_year is None:
@@ -637,6 +707,9 @@ class SARIX():
         else:
             # Not using Fourier terms, but set for consistency
             self.fourier_batch_shape = batch_shape
+
+        # one df for all batches ('shared'), or one per batch ('unshared' and 'partial')
+        self.innovation_df_batch_shape = () if innovation_df_pooling == 'shared' else batch_shape
 
         if intercept_pooling == 'shared':
             # no batches for intercept; will broadcast to share across all batches
@@ -1254,36 +1327,59 @@ class SARIX():
 
         # sample innovations with chosen distribution
         if self.innovation_dist == 'normal':
-            # Standard multivariate normal innovations
             numpyro.sample(
                 "step_innovations",
                 dist.MultivariateNormal(
                     loc=jnp.zeros((self.n_x + 1,)), scale_tril=Sigma_chol),
                 obs=step_innovations
             )
-        elif self.innovation_dist == 't':
-            # Student's t innovations with estimated degrees of freedom (unpooled by location)
-            # Sample df with a Gamma(2, 1/scale) prior for each location
-            # This has mean 2*scale and encourages df > 2 for finite variance
-            # batch_shape determines separate df per location
-            batch_shape = xy.shape[:-2]
-            innovation_df = numpyro.sample(
-                "innovation_df",
-                dist.Gamma(2.0, 1.0 / self.innovation_df_prior_scale).expand(batch_shape)
-            )
-            # innovation_df has shape batch_shape = (n_locations,)
-            # Sigma_chol has shape batch_shape + (1, n_x+1, n_x+1) due to time broadcast dimension
-            # Need to expand innovation_df to match: batch_shape + (1,) for time dimension
-            if len(xy.shape) > 2:
-                innovation_df = jnp.expand_dims(innovation_df, -1)
+        else:
+            # Student's t, standardized so that sigma is the innovation standard deviation.
+            # df - 2 has shape innovation_df_batch_shape; with batch dimensions, insert a
+            # dimension for time, as for Sigma_chol
+            df_excess = self._sample_innovation_df()
+            if len(xy.shape) > 2 and self.innovation_df_pooling != 'shared':
+                df_excess = jnp.expand_dims(df_excess, -1)
             numpyro.sample(
                 "step_innovations",
                 dist.MultivariateStudentT(
-                    df=innovation_df,
+                    df=2.0 + df_excess,
                     loc=jnp.zeros((self.n_x + 1,)),
-                    scale_tril=Sigma_chol),
+                    scale_tril=_standardized_t_scale_tril(Sigma_chol, df_excess)),
                 obs=step_innovations
             )
+
+
+    def _sample_innovation_df(self):
+        """
+        Sample the degrees of freedom of t innovations and return
+        innovation_df_excess = innovation_df - 2, with shape
+        innovation_df_batch_shape. Both are recorded in the samples. Working
+        with df - 2 avoids rounding it to 0 in float32 when df is close to 2.
+
+        'unshared' and 'shared': df has the Gamma(2, 1 / innovation_df_prior_scale)
+        prior truncated to df > 2 (Juarez and Steel, 2010), written as a
+        positive parameter df - 2 plus the Gamma log density of df; the
+        truncation's normalizing constant does not depend on parameters.
+        'partial': log(df - 2) = mu + sd * decentered for each batch, with
+        decentered ~ Normal(0, 1) (non-centred), mu ~ Normal with the mean and
+        sd of log(df - 2) under that truncated Gamma prior, and
+        sd ~ HalfCauchy(innovation_df_sd_prior_scale).
+        """
+        shape = self.innovation_df_batch_shape
+        if self.innovation_df_pooling == 'partial':
+            mu_loc, mu_scale = self.innovation_df_mu_prior
+            mu = numpyro.sample("innovation_df_mu", dist.Normal(mu_loc, mu_scale))
+            sd = numpyro.sample("innovation_df_sd", dist.HalfCauchy(self.innovation_df_sd_prior_scale))
+            decentered = numpyro.sample("innovation_df_decentered", dist.Normal(jnp.zeros(shape), 1.0))
+            df_excess = numpyro.deterministic("innovation_df_excess", jnp.exp(mu + sd * decentered))
+        else:
+            df_excess = numpyro.sample("innovation_df_excess",
+                                       dist.ImproperUniform(constraints.positive, shape, ()))
+            numpyro.factor("innovation_df_prior",
+                           dist.Gamma(2.0, 1.0 / self.innovation_df_prior_scale).log_prob(2.0 + df_excess).sum())
+        numpyro.deterministic("innovation_df", 2.0 + df_excess)
+        return df_excess
 
 
     def predict(self, rng_key):
@@ -1399,16 +1495,16 @@ class SARIX():
                     loc=jnp.zeros((self.n_x + 1,)),
                     scale_tril=Sigma_chol) \
                 .sample(rng_key, sample_shape=(self.forecast_horizon, ))
-        elif self.innovation_dist == 't':
-            # Load degrees of freedom from samples (unpooled by location)
-            innovation_df = self.samples['innovation_df']
-            # innovation_df has shape (num_samples, n_locations)
-            # batch_shape is (num_samples, n_locations) from theta/sigma
-            # df should match the batch dimensions for broadcasting
+        else:
+            # df - 2 has shape (num_samples,) + innovation_df_batch_shape; broadcast to batch_shape
+            df_excess = self.samples['innovation_df_excess']
+            if self.innovation_df_pooling == 'shared':
+                df_excess = df_excess.reshape(df_excess.shape + (1,) * len(xy_batch_shape))
+            df_excess = jnp.broadcast_to(df_excess, batch_shape)
             innovations = dist.MultivariateStudentT(
-                    df=innovation_df,
+                    df=2.0 + df_excess,
                     loc=jnp.zeros((self.n_x + 1,)),
-                    scale_tril=Sigma_chol) \
+                    scale_tril=_standardized_t_scale_tril(Sigma_chol, df_excess)) \
                 .sample(rng_key, sample_shape=(self.forecast_horizon, ))
 
         # generate step-ahead forecasts iteratively
