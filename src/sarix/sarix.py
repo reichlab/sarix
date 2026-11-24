@@ -174,6 +174,24 @@ def _all_positive(value):
     return bool(onp.all(onp.isfinite(value) & (value > 0)))
 
 
+def _log_softplus(u):
+    """
+    log(softplus(u)), also for very negative u, where softplus(u) underflows
+    to 0 but log(softplus(u)) is about u.
+    """
+    # the inner maximum keeps the unused branch (and its gradient) finite
+    return jnp.where(u < -20.0, u, jnp.log(jax.nn.softplus(jnp.maximum(u, -20.0))))
+
+
+def _non_finite_paths(pred):
+    """
+    Return a boolean array, with the shape of pred without its last two axes
+    (horizon and variable), that is True for forecast paths with any
+    non-finite value.
+    """
+    return ~onp.isfinite(pred).all(axis=(-2, -1))
+
+
 def _log_df_excess_moments(df_prior_scale):
     """
     Mean and standard deviation of log(df - 2) when df has the
@@ -333,6 +351,26 @@ class SARIX():
         is applied on the modeled scale, i.e. after transformation and
         differencing: with d=0 it is a level, and with d=1 it is a drift.
 
+    sigma_level : bool, default=False
+        Whether the innovation standard deviation depends on the previous
+        value of the series. Each variable's standard deviation at time t is
+        sigma * g(x), with x = y[t-1] - sigma_level_center.
+        Here y is the series on the modeled scale, with calendar effects
+        divided out if there are any.
+        sigma_level_center is the mean of the observed series on the modeled
+        scale over the time points of xy, for each batch and variable. It is
+        taken before any calendar adjustment on purpose: the calendar effects
+        are sampled, and this keeps the center fixed.
+        g(x) = softplus(a + b * x) / softplus(a), where b = sigma_level_coef
+        and a = sigma_level_offset is a learned offset per variable, so
+        g(0) = 1 and sigma is the standard deviation at a typical level of
+        the series. For large a + b * x, g grows linearly in x, so the
+        standard deviation is about proportional to x's distance from -a / b,
+        that is the level's distance from sigma_level_center - a / b. For very
+        negative a, g is close to exp(b * x) near the center.
+        Requires d=0, D=0 and at least one autoregressive lag (p > 0 or
+        P > 0). See Notes.
+
     **Pooling**
 
     For all pooling arguments except innovation_df_pooling, the deprecated
@@ -387,6 +425,25 @@ class SARIX():
           (calendar_effect_sd near 0); check `num_divergences` after fitting.
         Required when calendar_labels is given, must be None otherwise.
 
+    sigma_level_pooling : {'unshared', 'shared', 'partial'}, required if sigma_level
+        How to share the coefficients of the level-dependent innovation
+        standard deviation (sigma_level_coef, one per variable) across batches.
+        - 'unshared': Separate coefficients per batch/location, each with prior
+          Normal(0, sigma_level_prior_scale)
+        - 'shared': Single set of coefficients shared across all batches, with
+          the same prior
+        - 'partial': Separate coefficients per batch/location, shrunk toward a
+          learned common value: sigma_level_coef = sigma_level_mu +
+          sigma_level_sd * sigma_level_decentered with sigma_level_decentered ~
+          Normal(0, 1) (non-centered), sigma_level_mu ~
+          Normal(0, sigma_level_prior_scale) and sigma_level_sd /
+          sigma_level_prior_scale ~ HalfCauchy(sigma_level_sd_prior_scale),
+          each per variable.
+        For how the coefficients are sampled, see Notes. sigma_level_offset is
+        always shared across batches, whatever the pooling.
+        Required when sigma_level is True, must be None otherwise. The
+        deprecated alias 'none' is not accepted.
+
     **Prior scales**
 
     sigma_prior_scale : float, default=1.0
@@ -430,6 +487,38 @@ class SARIX():
         a != 1 (for example, logged and then standardized data): the effects
         are then a times the log multipliers, so the prior scale should be
         chosen on the scale of xy (see Notes).
+
+    sigma_level_prior_scale : float or array_like, optional
+        Scale of the Normal(0, sigma_level_prior_scale) prior on
+        sigma_level_coef ('unshared' and 'shared' pooling) or on its common
+        value sigma_level_mu ('partial'). May be a scalar or have shape
+        (n_x + 1,) for a separate scale per variable. The coefficient is per
+        unit of the series on the modeled scale, so a suitable scale depends
+        on that scale's units. If None (the default), it is set from the
+        data: for each variable, 1 / sd of the observed series on the modeled
+        scale about sigma_level_center, across all batches and time points.
+        A coefficient of one prior standard deviation then multiplies the
+        innovation standard deviation, at one data standard deviation above
+        the center, by softplus(a + 1) / softplus(a): about 1.9 at a = 0,
+        1.4 at a = 2 and 2.5 at a = -2, approaching e for very negative a.
+        The resolved value is stored in the `sigma_level_prior_scale`
+        attribute.
+
+    sigma_level_sd_prior_scale : float, default=1.0
+        Scale of the HalfCauchy prior on the spread of sigma_level_coef across
+        batches, in units of sigma_level_prior_scale: the prior on
+        sigma_level_sd is sigma_level_prior_scale times
+        HalfCauchy(sigma_level_sd_prior_scale), per variable. With the
+        default 1.0, the prior median of sigma_level_sd equals
+        sigma_level_prior_scale.
+        Only used when sigma_level_pooling='partial'.
+
+    sigma_level_offset_prior_scale : float, default=2.0
+        Scale of the Normal(0, sigma_level_offset_prior_scale) prior on
+        sigma_level_offset, one per variable and shared across batches. Only
+        used when sigma_level is True. The offset sets only the shape of g,
+        which one batch's data identify poorly, so it is not pooled like the
+        coefficients.
 
     **Innovation distribution**
 
@@ -503,6 +592,11 @@ class SARIX():
         (columns of xy) with at least one non-zero label, which get calendar
         effects.
 
+    sigma_level_center : ndarray
+        Only set when sigma_level is True. The mean of each variable over the
+        time points of xy, on the modeled scale and before any calendar
+        adjustment, with shape batch_shape + (n_x + 1,).
+
     Notes
     -----
     **Fourier Seasonality:**
@@ -531,6 +625,55 @@ class SARIX():
     `predictions_modeled_scale` holds forecasts of the transformed,
     differenced series with the calendar effects removed; `predictions`
     includes them.
+
+    **Level-dependent innovation scale:**
+    With sigma_level=True, the innovation standard deviation of variable j at
+    time t is sigma_j * g(y_j[t-1] - c_j), where c_j is sigma_level_center,
+    g(x) = softplus(a_j + b_j * x) / softplus(a_j), b_j = sigma_level_coef_j
+    and a_j = sigma_level_offset_j. sigma_j remains the innovation standard
+    deviation at the center, for both normal and t innovations. For a series
+    whose variability grows with its level more than the transformation
+    allows for, sigma_level_coef > 0. Both the likelihood and the forecasts
+    use this scale; in forecasts, y[t-1] is the previous simulated value, so
+    forecasts that rise widen faster.
+
+    g grows at most linearly. For large levels the standard deviation is then
+    about k * (y[t-1] - L), with L = c - a / b and k = sigma * b /
+    softplus(a), so each forecast step multiplies a path's distance from L by
+    a random factor whose spread does not depend on the level. On a
+    power-transformed scale this is like a further log transformation,
+    log(y - L): a standard deviation proportional to y - L is a constant
+    standard deviation of log(y - L), to first order.
+    sigma_level_offset is sampled directly (it is unitless) with a
+    Normal(0, sigma_level_offset_prior_scale) prior; the samples hold
+    'sigma_level_offset' with shape (num_samples, n_x + 1). When
+    sigma_level_coef is near 0, the data say little about
+    sigma_level_offset.
+
+    The feedback can still make a few forecast paths non-finite, for example
+    with a poorly converged fit or a very large coefficient. A path that is
+    finite on the modeled scale can also overflow when the transformation is
+    undone (exp with transform='log'). Quantiles taken over such paths may be
+    inf or NaN, and the forecasts are not capped. predict warns with the
+    number of paths that are non-finite on the modeled scale, and fitting
+    also warns with the number of paths that are finite on the modeled scale
+    but not on the original scale (`predictions`).
+
+    The coefficients are sampled in standardized units, so that NUTS works
+    whatever the units of the series: with s = sigma_level_prior_scale,
+    sigma_level_coef = s * sigma_level_coef_z with sigma_level_coef_z ~
+    Normal(0, 1) ('unshared' and 'shared'), or sigma_level_coef = s *
+    (sigma_level_mu_z + sigma_level_sd_z * sigma_level_decentered) with
+    sigma_level_mu_z ~ Normal(0, 1), sigma_level_sd_z ~
+    HalfCauchy(sigma_level_sd_prior_scale) and sigma_level_decentered ~
+    Normal(0, 1) ('partial'). The samples hold 'sigma_level_coef' with shape
+    (num_samples,) + batch_shape + (n_x + 1,) ('unshared' or 'partial') or
+    (num_samples, n_x + 1) ('shared'), and the standardized sites:
+    'sigma_level_coef_z' ('unshared' or 'shared'), or 'sigma_level_mu_z',
+    'sigma_level_sd_z' and 'sigma_level_decentered' ('partial'). With
+    'partial' they also hold 'sigma_level_mu' = s * sigma_level_mu_z and
+    'sigma_level_sd' = s * sigma_level_sd_z, with shape (num_samples, n_x + 1),
+    in the units of the coefficients.
 
     **Day-of-year format:**
     The day_of_year parameter expects integer values 0-365 (or 1-366).
@@ -580,12 +723,14 @@ class SARIX():
                  input_center=None,
                  fourier_K=0,
                  include_intercept=False,
+                 sigma_level=False,
                  # pooling
                  theta_pooling='unshared',
                  sigma_pooling='unshared',
                  fourier_pooling=None,
                  intercept_pooling=None,
                  calendar_pooling=None,
+                 sigma_level_pooling=None,
                  # prior scales
                  sigma_prior_scale=1.0,
                  theta_sd_prior_scale=1.0,
@@ -594,6 +739,9 @@ class SARIX():
                  intercept_mu_prior_scale=None,
                  calendar_effect_sd_prior_scale=1.0,
                  calendar_effect_mu_prior_scale=1.0,
+                 sigma_level_prior_scale=None,
+                 sigma_level_sd_prior_scale=1.0,
+                 sigma_level_offset_prior_scale=2.0,
                  # innovation distribution
                  innovation_dist='normal',
                  innovation_df_pooling=None,
@@ -671,6 +819,35 @@ class SARIX():
             # (truncated Gamma) prior used for df with 'unshared' and 'shared' pooling
             self.innovation_df_mu_prior = _log_df_excess_moments(innovation_df_prior_scale)
 
+        # Validate level-dependent innovation scale parameters
+        if sigma_level and sigma_level_pooling is None:
+            raise ValueError("sigma_level_pooling must be specified when sigma_level is True")
+        if not sigma_level and sigma_level_pooling is not None:
+            raise ValueError("sigma_level_pooling should not be specified when sigma_level is False")
+        if sigma_level_pooling is not None:
+            # a new parameter: the deprecated 'none' alias is not accepted
+            sigma_level_pooling = _validate_pooling(sigma_level_pooling, 'sigma_level_pooling',
+                                                    PARTIAL_POOLING_OPTIONS, allow_none_alias=False)
+        if sigma_level and (d != 0 or D != 0):
+            raise ValueError("sigma_level requires d=0 and D=0")
+        if sigma_level and self.max_lag == 0:
+            raise ValueError("sigma_level requires at least one autoregressive lag (p > 0 or P > 0)")
+        # the prior scales are only checked when they are used; NaN, inf and None are rejected
+        if sigma_level and sigma_level_prior_scale is not None:
+            sigma_level_prior_scale = _per_variable(sigma_level_prior_scale, 'sigma_level_prior_scale',
+                                                    xy.shape[-1])
+            if not _all_positive(sigma_level_prior_scale):
+                raise ValueError("sigma_level_prior_scale must be positive and finite")
+        if sigma_level_pooling == 'partial' and not _all_positive(sigma_level_sd_prior_scale):
+            raise ValueError("sigma_level_sd_prior_scale must be positive and finite")
+        if sigma_level and not _all_positive(sigma_level_offset_prior_scale):
+            raise ValueError("sigma_level_offset_prior_scale must be positive and finite")
+        self.sigma_level = bool(sigma_level)
+        self.sigma_level_offset_prior_scale = sigma_level_offset_prior_scale
+        self.sigma_level_pooling = sigma_level_pooling
+        self.sigma_level_prior_scale = sigma_level_prior_scale
+        self.sigma_level_sd_prior_scale = sigma_level_sd_prior_scale
+
         # Validate Fourier parameters
         if fourier_K > 0 and day_of_year is None:
             raise ValueError("day_of_year must be provided when fourier_K > 0")
@@ -725,6 +902,8 @@ class SARIX():
 
         # one df for all batches ('shared'), or one per batch ('unshared' and 'partial')
         self.innovation_df_batch_shape = () if innovation_df_pooling == 'shared' else batch_shape
+        # likewise for the coefficients of the level-dependent innovation scale
+        self.sigma_level_batch_shape = () if sigma_level_pooling == 'shared' else batch_shape
 
         if intercept_pooling == 'shared':
             # no batches for intercept; will broadcast to share across all batches
@@ -843,6 +1022,14 @@ class SARIX():
         self.xy_transformed = self.xy
         self.xy = diff(self.xy, self.d, self.D, self.season_period, pad_na=False)
 
+        # center of the level-dependent innovation scale (d = D = 0, so xy is not differenced),
+        # and a data-based scale for the prior on its coefficients if not provided
+        if self.sigma_level:
+            self.sigma_level_center = onp.mean(self.xy_transformed, axis=-2)
+            if self.sigma_level_prior_scale is None:
+                self.sigma_level_prior_scale = self._default_sigma_level_prior_scale(
+                    self.xy_transformed, self.sigma_level_center)
+
         # set a data-based scale for the intercept_mu prior if not provided;
         # this uses the modeled scale, where the intercept is applied
         if self.intercept_pooling == 'partial' and self.intercept_mu_prior_scale is None:
@@ -891,6 +1078,17 @@ class SARIX():
         elif transform == "sqrt":
             self.predictions = onp.maximum(0.0, self.predictions)**2
 
+        if self.sigma_level:
+            # paths finite on the modeled scale can still overflow when the transformation is
+            # undone (exp with transform='log'); predict already warned about the others
+            bad = _non_finite_paths(self.predictions) & ~_non_finite_paths(self.predictions_modeled_scale)
+            if bad.any():
+                warnings.warn(f"{bad.sum()} of {bad.size} forecast paths (samples times batches) are finite on "
+                              f"the modeled scale but have non-finite values on the original scale, after the "
+                              f"transformation is undone, possibly from the feedback of the level-dependent "
+                              f"innovation scale (sigma_level); quantiles over them may be inf or NaN. Check the "
+                              f"fit (divergences, convergence) or use a shorter forecast_horizon")
+
 
     @staticmethod
     def _default_intercept_mu_prior_scale(xy):
@@ -912,6 +1110,32 @@ class SARIX():
         n_vars = xy.shape[-1]
         rms = onp.sqrt(onp.nanmean(onp.square(xy.reshape(-1, n_vars)), axis=0))
         return onp.where(rms > 0, 2.5 * rms, 1.0)
+
+
+    @staticmethod
+    def _default_sigma_level_prior_scale(xy, center):
+        """
+        Data-based scale for the prior on the level coefficients: for each
+        variable, 1 / sd of xy (on the modeled scale) about center, across all
+        batches and time points.
+
+        Parameters
+        ----------
+        xy : ndarray
+            Data on the modeled scale, with shape batch_shape + (T, n_x + 1)
+        center : ndarray
+            Centre of each batch and variable, with shape
+            batch_shape + (n_x + 1,)
+
+        Returns
+        -------
+        ndarray of shape (n_x + 1,). Variables that are constant within each
+        batch get a scale of 1.0, since 1 / 0 is not a valid prior scale.
+        """
+        n_vars = xy.shape[-1]
+        dev = (xy - onp.expand_dims(center, -2)).reshape(-1, n_vars)
+        sd = onp.sqrt(onp.nanmean(onp.square(dev), axis=0))
+        return onp.where(sd > 0, 1.0 / onp.where(sd > 0, sd, 1.0), 1.0)
 
 
     def _calculate_fourier_features(self, day_of_year, K):
@@ -1340,6 +1564,17 @@ class SARIX():
         # with shape (batch_shape, T - self.max_lag, n_x + 1)
         step_innovations = xy[..., self.max_lag:, :] - step_means
 
+        # level-dependent innovation scale: one standard deviation per time point, from the
+        # previous value of the series (xy is not differenced, as d = D = 0). Sigma is diagonal,
+        # so Sigma_chol becomes batch_shape + (T - max_lag, n_x + 1, n_x + 1)
+        if self.sigma_level:
+            coef = self._sample_sigma_level_coef()
+            offset = numpyro.sample("sigma_level_offset",
+                                    dist.Normal(jnp.zeros(xy.shape[-1]), self.sigma_level_offset_prior_scale))
+            factor = self._sigma_level_factor(jnp.expand_dims(coef, -2), xy[..., self.max_lag - 1:-1, :],
+                                              jnp.expand_dims(self.sigma_level_center, -2), offset)
+            Sigma_chol = jnp.expand_dims(jnp.expand_dims(sigma, -2) * factor, -2) * jnp.eye(sigma.shape[-1])
+
         # sample innovations with chosen distribution
         if self.innovation_dist == 'normal':
             numpyro.sample(
@@ -1397,6 +1632,43 @@ class SARIX():
         return df_excess
 
 
+    @staticmethod
+    def _sigma_level_factor(coef, level, center, offset):
+        """
+        Multiplier of the innovation standard deviation given the previous
+        value of the series: softplus(offset + coef * (level - center)) /
+        softplus(offset), computed on the log scale so that it stays finite
+        for very negative offsets. The arguments broadcast against each
+        other; offset has the shape of the last axis or broadcasts to the
+        others.
+        """
+        return jnp.exp(_log_softplus(offset + coef * (level - center)) - _log_softplus(offset))
+
+
+    def _sample_sigma_level_coef(self):
+        """
+        Sample the coefficients of the level-dependent innovation scale, with
+        shape sigma_level_batch_shape + (n_x + 1,), in standardized units
+        (see the class Notes). The coefficients, and with 'partial'
+        sigma_level_mu and sigma_level_sd, are recorded as deterministic
+        sites in coefficient units.
+        """
+        n_vars = self.n_x + 1
+        shape = self.sigma_level_batch_shape + (n_vars,)
+        scale = jnp.asarray(self.sigma_level_prior_scale)
+        if self.sigma_level_pooling == 'partial':
+            mu_z = numpyro.sample("sigma_level_mu_z", dist.Normal(jnp.zeros(n_vars), 1.0))
+            sd_z = numpyro.sample("sigma_level_sd_z",
+                                  dist.HalfCauchy(self.sigma_level_sd_prior_scale * jnp.ones(n_vars)))
+            decentered = numpyro.sample("sigma_level_decentered", dist.Normal(jnp.zeros(shape), 1.0))
+            numpyro.deterministic("sigma_level_mu", scale * mu_z)
+            numpyro.deterministic("sigma_level_sd", scale * sd_z)
+            return numpyro.deterministic("sigma_level_coef", scale * (mu_z + sd_z * decentered))
+        else:
+            z = numpyro.sample("sigma_level_coef_z", dist.Normal(jnp.zeros(shape), 1.0))
+            return numpyro.deterministic("sigma_level_coef", scale * z)
+
+
     def predict(self, rng_key):
         '''
         Predict future values of all signals based on a single sample of
@@ -1429,6 +1701,17 @@ class SARIX():
             sigma = sigma.reshape(sigma_sample_batch_shape + ones + (sigma.shape[-1],))
             target = sigma_sample_batch_shape + xy_batch_shape + (sigma.shape[-1],)
             sigma = jnp.broadcast_to(sigma, target)
+
+        if self.sigma_level:
+            sigma_level_coef = self.samples['sigma_level_coef']
+            if self.sigma_level_pooling == 'shared':
+                # (num_samples, n_x + 1) -> (num_samples,) + xy_batch_shape + (n_x + 1,)
+                ones = (1,) * len(xy_batch_shape)
+                sigma_level_coef = sigma_level_coef.reshape(
+                    sigma_level_coef.shape[:1] + ones + sigma_level_coef.shape[-1:])
+            # (num_samples, n_x + 1) -> (num_samples,) + xy_batch_shape + (n_x + 1,)
+            offset = self.samples['sigma_level_offset']
+            sigma_level_offset = offset.reshape(offset.shape[:1] + (1,) * len(xy_batch_shape) + offset.shape[-1:])
 
         # batch_shape is (num_samples,) + xy_batch_shape. It is taken from sigma
         # rather than theta because theta is not sampled when there are no
@@ -1546,14 +1829,30 @@ class SARIX():
             else:
                 fourier_mean = 0
 
-            new_y_pred = ar_mean + intercept_mean + fourier_mean + jnp.expand_dims(innovations[h, ...], -2)
+            innovation = innovations[h, ...]
+            if self.sigma_level:
+                # scale by the level-dependent factor from the previous (observed or simulated)
+                # value; Sigma is diagonal, so this gives standard deviation sigma * factor for
+                # both normal and t innovations
+                innovation = innovation * self._sigma_level_factor(
+                    sigma_level_coef, recent_lags[..., -1, :], self.sigma_level_center, sigma_level_offset)
+            new_y_pred = ar_mean + intercept_mean + fourier_mean + jnp.expand_dims(innovation, -2)
             y_pred.append(new_y_pred)
             if self.max_lag > 0:
                 recent_lags = jnp.concatenate([recent_lags[..., 1:, :], new_y_pred],
                                               axis=-2)
 
-        y_pred = jnp.concatenate(y_pred, axis=-2)
-        return onp.asarray(y_pred)
+        y_pred = onp.asarray(jnp.concatenate(y_pred, axis=-2))
+        if self.sigma_level:
+            # the level feedback can make a few paths overflow; a path is one sample of one batch
+            bad = _non_finite_paths(y_pred)
+            if bad.any():
+                warnings.warn(f"{bad.sum()} of {bad.size} forecast paths (samples times batches) have "
+                              f"non-finite values on the modeled scale, possibly from the feedback of the "
+                              f"level-dependent innovation scale (sigma_level); quantiles over them may be inf "
+                              f"or NaN. Check the fit (divergences, convergence) or use a shorter "
+                              f"forecast_horizon")
+        return y_pred
 
 
     def plot(self, save_path = None):

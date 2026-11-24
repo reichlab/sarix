@@ -8,6 +8,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Level-dependent innovation scale**: new `sigma_level` parameter. With `sigma_level=True`, each variable's
+  innovation standard deviation at time t is `sigma * softplus(a + b * x) / softplus(a)`, where
+  `x = y[t-1] - sigma_level_center`, `y` is the series on the modeled scale (with calendar effects divided out, if
+  any) and `sigma_level_center` (a new attribute) is the mean of the observed series on the modeled scale. `b` is `sigma_level_coef` and `a` is `sigma_level_offset`, one per variable and shared across
+  batches. Forecasts use the previous simulated value. `predict` warns about forecast paths that are non-finite on
+  the modeled scale, and fitting also warns about paths that are finite on the modeled scale but overflow when the
+  transformation is undone (for example with `transform='log'`). Works with normal and t innovations. Requires
+  `d=0`, `D=0` and at least one AR lag. See the class docstring for the details.
+  - New `sigma_level_pooling` parameter (`'unshared'`, `'shared'` or `'partial'`), required with `sigma_level=True`.
+    The deprecated alias `'none'` is not accepted.
+  - New prior scales: `sigma_level_prior_scale` for the coefficients (by default set from the data: 1 / sd of each
+    variable about `sigma_level_center`, on the modeled scale), `sigma_level_sd_prior_scale` (default 1.0) for their spread with `'partial'`,
+    and `sigma_level_offset_prior_scale` (default 2.0) for the offset.
 - **t-distributed innovations**: new `innovation_dist` parameter (`'normal'`, the default, or `'t'`). With
   `'t'`, innovations are multivariate Student's t with `innovation_df` > 2 degrees of freedom, standardized so
   that `sigma` remains the innovation standard deviation. The prior on `innovation_df` is Gamma(2, 1 /
