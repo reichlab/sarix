@@ -221,7 +221,7 @@ def test_log_density_matches_manual(transform, input_power, center, d):
 
 
 def two_variable_setup(T, h):
-    """Exogenous variable on the log scale (power 0, centre unknown) and target on a fourth-root, centred
+    """Exogenous variable on the log scale (power 0, center unknown) and target on a fourth-root, centered
     scale, with different labels for the two variables."""
     x = xy2(T=T)
     lab = np.stack([labels(T, h, period=13), labels(T, h, period=7)], -1)  # (T + h, 2)
@@ -261,7 +261,7 @@ def test_log_density_two_variables():
 
 
 def test_log_density_partial_pooling():
-    """Non-centred partial pooling: effect = mu + sd * decentered. Log density = that of a model without
+    """Non-centered partial pooling: effect = mu + sd * decentered. Log density = that of a model without
     calendar effects on the adjusted series + priors on sd, mu (per-variable scale) and decentered + Jacobian."""
     T, h, d = 40, 2, 1
     x, lab, power, center = two_variable_setup(T, h)
@@ -353,7 +353,7 @@ def test_unshared_and_no_batch_shapes():
 
 
 def test_input_center_per_variable():
-    """Only the target's centre is used; an exogenous variable's centre may be NaN (unknown)."""
+    """Only the target's center is used; an exogenous variable's center may be NaN (unknown)."""
     T, h = 40, 2
     x = np.stack([ar1_data(B=2, T=T, seed=1), ar1_data(B=2, T=T, seed=2)], -1) + 1.0  # (B, T, 2)
     common = dict(p=1, theta_pooling='shared', sigma_pooling='shared', input_power=0.25,
@@ -364,7 +364,7 @@ def test_input_center_per_variable():
     c = np.array([[1.0], [2.0]])
     np.testing.assert_allclose(z[..., 1], np.exp(-0.25) * (x[..., 1] + c) - c, rtol=1e-6)
     np.testing.assert_allclose(z[..., 0], x[..., 0])
-    # shape (n_x + 1,): one centre per variable, shared by all batches
+    # shape (n_x + 1,): one center per variable, shared by all batches
     m2 = SARIX(x, input_center=np.array([5.0, 1.0]), **common)
     np.testing.assert_allclose(m2.input_center, [[5.0, 1.0], [5.0, 1.0]])
 
@@ -385,7 +385,7 @@ def test_exogenous_variables_not_adjusted():
 
 
 def test_recovers_effects():
-    """Fourth-root, centred scale with known multipliers exp(0.4), exp(0.8)."""
+    """Fourth-root, centered scale with known multipliers exp(0.4), exp(0.8)."""
     B, T, h = 3, 300, 4
     lam, c = 0.25, np.array([1.0, 1.5, 2.0])
     z = ar1_data(B=B, T=T, phi=0.8, seed=3)
@@ -419,7 +419,7 @@ def test_recovers_separate_effects_per_variable():
 
 @pytest.mark.parametrize("effect_sd", [0.0, 0.15])  # identical effects (the funnel case); spread-out effects
 def test_partial_pooling_recovers_effects_without_divergences(effect_sd):
-    """Each batch's effects = common effects + effect_sd * noise, on a fourth-root, centred scale."""
+    """Each batch's effects = common effects + effect_sd * noise, on a fourth-root, centered scale."""
     B, T, h = 10, 156, 4
     lam = 0.25
     rng = np.random.default_rng(5)
@@ -461,11 +461,11 @@ def test_diff_accepts_array_likes():
 
 def test_warns_when_values_below_negative_center():
     """With power > 0, xy + input_center < 0 cannot come from a positive original-scale quantity."""
-    xy = ar1_data(B=2, T=30)[..., None]  # centred around 0
+    xy = ar1_data(B=2, T=30)[..., None]  # centered around 0
     with pytest.warns(UserWarning, match=r"variables \[0\] have calendar effects but take values below"):
         _ = SARIX(xy, p=1, theta_pooling='shared', sigma_pooling='shared', calendar_labels=cal(labels(30, 1)),
                   calendar_pooling='shared', forecast_horizon=1, **FAST)
-    with warnings.catch_warnings():  # the same data with a centre that makes them positive
+    with warnings.catch_warnings():  # the same data with a center that makes them positive
         warnings.simplefilter("error")
         SARIX(xy, p=1, theta_pooling='shared', sigma_pooling='shared', input_center=5.0,
               calendar_labels=cal(labels(30, 1)), calendar_pooling='shared', forecast_horizon=1, **FAST)
