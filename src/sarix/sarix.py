@@ -516,7 +516,9 @@ class SARIX():
     sigma_level_offset_prior_scale : float, default=2.0
         Scale of the Normal(0, sigma_level_offset_prior_scale) prior on
         sigma_level_offset, one per variable and shared across batches. Only
-        used when sigma_level is True.
+        used when sigma_level is True. The offset sets only the shape of g,
+        which one batch's data identify poorly, so it is not pooled like the
+        coefficients.
 
     **Innovation distribution**
 
