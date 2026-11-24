@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   variance is finite
   - New `innovation_df_pooling` parameter (`'unshared'`, `'shared'` or `'partial'`), required with
     `innovation_dist='t'`. `'partial'` shrinks each batch's log(`innovation_df` - 2) toward a learned common
-    value (non-centred), with spread given a HalfCauchy(`innovation_df_sd_prior_scale`) prior. The deprecated
+    value (non-centered), with spread given a HalfCauchy(`innovation_df_sd_prior_scale`) prior. The deprecated
     alias `'none'` is not accepted
   - The samples hold `innovation_df` and `innovation_df_excess` (`innovation_df` - 2). The model works with
     `innovation_df_excess`, so the likelihood stays finite when `innovation_df` is very close to 2 in float32
@@ -26,13 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the adjustment, and forecasts at labelled time points are mapped back. See the class docstring.
   - New `calendar_pooling` parameter (`'unshared'`, `'shared'` or `'partial'`), required with
     `calendar_labels`. Effects are separate for each batch under `'unshared'` and `'partial'`; `'partial'`
-    shrinks them toward a learned common effect `calendar_effect_mu` (non-centred parameterization)
+    shrinks them toward a learned common effect `calendar_effect_mu` (non-centered parameterization)
   - New `calendar_effect_sd_prior_scale` and `calendar_effect_mu_prior_scale` parameters
   - Warns when an effect's label never occurs in the data time points (or only in the forecast horizon),
     so that the effect is drawn from the prior, and when a variable with effects and power > 0 takes values
     below `-input_center`, which cannot come from a positive quantity on the original scale
 - **Input scale description**: new `input_power` and `input_center` parameters (only with
-  `transform='none'`) declare that `xy` was power-transformed (power 0 = log) and centred before being
+  `transform='none'`) declare that `xy` was power-transformed (power 0 = log) and centered before being
   passed to SARIX. They are used only by calendar effects, which then act as multipliers on the original
   scale (with power 0, on the scale of `xy`)
 - **Divergence count**: the number of divergent MCMC transitions is stored in the new `num_divergences` attribute

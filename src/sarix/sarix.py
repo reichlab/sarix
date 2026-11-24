@@ -380,7 +380,7 @@ class SARIX():
           Normal(calendar_effect_mu, calendar_effect_sd), where
           calendar_effect_mu is a learned mean for each variable and label.
           Effects are shrunk toward that common effect rather than toward 0.
-          They are sampled non-centred, as calendar_effect_mu +
+          They are sampled non-centered, as calendar_effect_mu +
           calendar_effect_sd * calendar_effect_decentered with
           calendar_effect_decentered ~ Normal(0, 1), which reduces divergent
           transitions when the effects are tightly clustered
@@ -448,7 +448,7 @@ class SARIX():
         - 'partial': Separate df per batch/location, shrunk toward a common
           value: log(innovation_df - 2) = innovation_df_mu + innovation_df_sd *
           innovation_df_decentered with innovation_df_decentered ~ Normal(0, 1)
-          (non-centred). innovation_df_mu has a Normal prior with the mean and
+          (non-centered). innovation_df_mu has a Normal prior with the mean and
           standard deviation of log(df - 2) under the prior below, and
           innovation_df_sd ~ HalfCauchy(innovation_df_sd_prior_scale).
         Required when innovation_dist='t', must be None otherwise. The deprecated
@@ -519,7 +519,7 @@ class SARIX():
     the series with these effects divided out (the likelihood includes the
     Jacobian of this adjustment), and forecasts at labelled time points are
     multiplied back. The adjustment is made on the modeled scale using the
-    power and centre given by `transform` or by input_power and input_center.
+    power and center given by `transform` or by input_power and input_center.
     The priors on the effects are described under
     calendar_pooling and the calendar prior scales.
 
@@ -1189,7 +1189,7 @@ class SARIX():
         effect_shape = self.calendar_batch_shape + (len(self.calendar_variables), self.n_calendar)
         if self.calendar_pooling == 'partial':
             # learned mean for each variable and label, shared across batches; each batch's effects are
-            # shrunk toward it. Non-centred: effect = mu + sd * decentered with decentered ~ Normal(0, 1),
+            # shrunk toward it. Non-centered: effect = mu + sd * decentered with decentered ~ Normal(0, 1),
             # which avoids the funnel between the effects and effect_sd when effect_sd is near 0
             mu_scale = self.calendar_effect_mu_prior_scale[self.calendar_variables][:, None]
             effect_mu = numpyro.sample(
@@ -1377,7 +1377,7 @@ class SARIX():
         positive parameter df - 2 plus the Gamma log density of df; the
         truncation's normalizing constant does not depend on parameters.
         'partial': log(df - 2) = mu + sd * decentered for each batch, with
-        decentered ~ Normal(0, 1) (non-centred), mu ~ Normal with the mean and
+        decentered ~ Normal(0, 1) (non-centered), mu ~ Normal with the mean and
         sd of log(df - 2) under that truncated Gamma prior, and
         sd ~ HalfCauchy(innovation_df_sd_prior_scale).
         """
